@@ -13,6 +13,7 @@ bot.use(session());
 // ХРАНИЛИЩЕ ЗАКАЗОВ
 // =====================
 const orders = new Map();
+const pendingEmailByChatId = new Map(); // chatId -> orderId (ждут ввода email)
 
 function generateOrderId() {
   return crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -138,13 +139,31 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
     `💳 Сумма: *${formatPrice(account.price)}*\n\n` +
     `После оплаты введите ваше *полное имя и первую букву фамилии*\n` +
     `_(например: Александр К)_\n\n` +
-    `⚠️ *ВАЖНО:* Укажите имя точно так, как вы указали в банке при переводе. Если имя не совпадёт — оплата не будет подтверждена!`,
+    `⚠️ *ВАЖНО:* Укажите имя точно так, как указано в банке при переводе. Если имя не совпадёт — оплата не будет подтверждена!`,
     { parse_mode: 'Markdown' }
   );
 });
 
 // =====================
-// ОБРАБОТКА ТЕКСТА (все шаги)
+// MIDDLEWARE: восстановить step если ждём email
+// Должен быть ДО bot.on('text')
+// =====================
+bot.use(async (ctx, next) => {
+  if (ctx.message?.text) {
+    ctx.session = ctx.session || {};
+    const chatId = String(ctx.chat?.id);
+    const pendingOrderId = pendingEmailByChatId.get(chatId);
+    if (pendingOrderId && ctx.session.step !== 'awaiting_email') {
+      ctx.session.step = 'awaiting_email';
+      ctx.session.orderId = pendingOrderId;
+      pendingEmailByChatId.delete(chatId);
+    }
+  }
+  return next();
+});
+
+// =====================
+// ОБРАБОТКА ТЕКСТА
 // =====================
 bot.on('text', async (ctx) => {
   ctx.session = ctx.session || {};
@@ -160,7 +179,7 @@ bot.on('text', async (ctx) => {
       '2️⃣ Оплатите через СБП\n' +
       '3️⃣ Введите имя как в банке\n' +
       '4️⃣ Дождитесь подтверждения\n' +
-      '5️⃣ Напишите email продавцу\n' +
+      '5️⃣ Напишите свой email\n' +
       '6️⃣ Получите код и передайте продавцу'
     );
   }
@@ -171,7 +190,10 @@ bot.on('text', async (ctx) => {
   // =====================
   if (step === 'awaiting_payment_info') {
     if (text.length < 3) {
-      return ctx.reply('❌ Введите полное имя и первую букву фамилии.\n_(например: Александр К)_', { parse_mode: 'Markdown' });
+      return ctx.reply(
+        '❌ Введите полное имя и первую букву фамилии.\n_(например: Александр К)_',
+        { parse_mode: 'Markdown' }
+      );
     }
 
     const account = getAccountById(ctx.session.selectedAccountId);
@@ -217,7 +239,7 @@ bot.on('text', async (ctx) => {
           `🎮 Аккаунт: ${account.title}\n` +
           `🏆 Кубки: ${account.trophies.toLocaleString('ru-RU')}\n` +
           `💰 Цена: ${formatPrice(account.price)}\n\n` +
-          `🔍 Проверьте перевод по имени и подтвердите заказ:`,
+          `🔍 Проверьте перевод по имени и подтвердите:`,
           {
             parse_mode: 'Markdown',
             reply_markup: {
@@ -248,7 +270,10 @@ bot.on('text', async (ctx) => {
   if (step === 'awaiting_email') {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(text)) {
-      return ctx.reply('❌ Неверный формат email.\n_(например: example@mail.ru)_\n\nПопробуйте ещё раз:', { parse_mode: 'Markdown' });
+      return ctx.reply(
+        '❌ Неверный формат email.\n_(например: example@mail.ru)_\n\nПопробуйте ещё раз:',
+        { parse_mode: 'Markdown' }
+      );
     }
 
     const orderId = ctx.session.orderId;
@@ -265,12 +290,12 @@ bot.on('text', async (ctx) => {
 
     await ctx.reply(
       `📧 Email принят: *${text}*\n\n` +
-      `Продавец получил ваш email и скоро пришлёт код для передачи аккаунта.\n` +
+      `Продавец получил ваш email и скоро пришлёт код.\n` +
       `⏳ Ожидайте...`,
       { parse_mode: 'Markdown' }
     );
 
-    // Уведомить админа что покупатель ввёл email
+    // Уведомить админа
     if (ADMIN_CHAT_ID) {
       try {
         await bot.telegram.sendMessage(
@@ -278,7 +303,7 @@ bot.on('text', async (ctx) => {
           `📧 *Заказ #${orderId}* — покупатель указал email:\n\n` +
           `👤 Имя: ${order.buyerName}\n` +
           `📧 Email: *${text}*\n\n` +
-          `Введите код для передачи аккаунта командой:\n` +
+          `Введите код командой:\n` +
           `/setcode ${orderId} КОД`,
           { parse_mode: 'Markdown' }
         );
@@ -324,25 +349,23 @@ bot.action(/^fulfill_(.+)$/, async (ctx) => {
   await ctx.reply(
     `✅ *Заказ #${orderId} подтверждён.*\n` +
     `👤 Имя: ${order.buyerName}\n\n` +
-    `Покупатель получил запрос на email.`,
+    `Ожидаю email от покупателя...`,
     { parse_mode: 'Markdown' }
   );
 
-  // Попросить покупателя ввести email
+  // Записать в Map что этот chatId ждёт ввода email
+  pendingEmailByChatId.set(String(order.chatId), orderId);
+
+  // Уведомить покупателя
   if (order.chatId) {
     try {
       await bot.telegram.sendMessage(
         order.chatId,
         `🎉 *Оплата подтверждена!*\n\n` +
-        `Теперь напишите продавцу ваш *email* прямо здесь в чат:\n` +
-        `_(например: example@mail.ru)_\n\n` +
-        `На него будут отправлены детали заказа.`,
+        `Напишите ваш *email* прямо сюда в чат:\n` +
+        `_(например: example@mail.ru)_`,
         { parse_mode: 'Markdown' }
       );
-
-      // Обновить шаг в сессии покупателя
-      // (сессия хранится по chatId, нужно обновить через Map)
-      pendingEmailByChatId.set(String(order.chatId), orderId);
     } catch (e) {
       console.warn('Cannot notify buyer:', e.message);
     }
@@ -397,8 +420,6 @@ bot.action(/^reject_(.+)$/, async (ctx) => {
 // =====================
 // КОМАНДА АДМИНА: /setcode ORDERID КОД
 // =====================
-const pendingEmailByChatId = new Map();
-
 bot.command('setcode', async (ctx) => {
   if (String(ctx.chat.id) !== String(ADMIN_CHAT_ID)) return;
 
@@ -422,11 +443,8 @@ bot.command('setcode', async (ctx) => {
   order.status = 'fulfilled';
   orders.set(orderId, order);
 
-  await ctx.reply(
-    `✅ Код для заказа #${orderId} установлен.\nПокупатель получит уведомление.`,
-  );
+  await ctx.reply(`✅ Код установлен. Покупатель получит уведомление.`);
 
-  // Отправить код покупателю
   if (order.chatId) {
     try {
       await bot.telegram.sendMessage(
@@ -442,25 +460,6 @@ bot.command('setcode', async (ctx) => {
       console.warn('Cannot send code to buyer:', e.message);
     }
   }
-});
-
-// =====================
-// MIDDLEWARE: перехват email после подтверждения
-// (на случай если сессия сбросилась)
-// =====================
-// Уже обрабатывается через step === 'awaiting_email' в bot.on('text')
-// pendingEmailByChatId используется как резервный механизм
-bot.use(async (ctx, next) => {
-  if (ctx.message?.text && ctx.session) {
-    const chatId = String(ctx.chat?.id);
-    const orderId = pendingEmailByChatId.get(chatId);
-    if (orderId && !ctx.session.step) {
-      ctx.session.step = 'awaiting_email';
-      ctx.session.orderId = orderId;
-      pendingEmailByChatId.delete(chatId);
-    }
-  }
-  return next();
 });
 
 // =====================
@@ -507,3 +506,4 @@ console.log('✅ Bot started');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
