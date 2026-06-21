@@ -10,7 +10,7 @@ const bot = new Telegraf(BOT_TOKEN);
 bot.use(session());
 
 // =====================
-// ХРАНИЛИЩЕ ЗАКАЗОВ (в памяти)
+// ХРАНИЛИЩЕ ЗАКАЗОВ
 // =====================
 const orders = new Map();
 
@@ -156,6 +156,8 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  if (text === '📋 Каталог аккаунтов') return;
+
   if (step === 'awaiting_email') {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(text)) {
@@ -184,6 +186,11 @@ bot.on('text', async (ctx) => {
         ]),
       }
     );
+    return;
+  }
+
+  if (step === 'awaiting_confirmation') {
+    return ctx.reply('⏳ Ваш заказ на проверке. Ожидайте подтверждения от продавца.');
   }
 });
 
@@ -201,7 +208,6 @@ bot.action('confirm_payment', async (ctx) => {
   }
 
   await ctx.answerCbQuery('Создаём заказ...');
-  await ctx.reply('⏳ Создаём заказ, подождите...');
 
   try {
     const orderId = generateOrderId();
@@ -249,8 +255,10 @@ bot.action('confirm_payment', async (ctx) => {
         }
       );
     }
+
   } catch (e) {
     console.error('Create order error:', e.message);
+    ctx.session.step = null;
     await ctx.reply('❌ Не удалось создать заказ. Попробуйте позже или напишите @brawlhelpp');
   }
 });
@@ -268,18 +276,18 @@ bot.action('cancel_order', async (ctx) => {
 });
 
 // =====================
-// ✅ КНОПКИ АДМИНА: ПОДТВЕРДИТЬ / ОТКЛОНИТЬ
+// КНОПКИ АДМИНА: ПОДТВЕРДИТЬ
 // =====================
 bot.action(/^fulfill_(.+)$/, async (ctx) => {
   const orderId = ctx.match[1];
   const order = orders.get(orderId);
 
   if (!order) {
-    await ctx.answerCbQuery('❌ Заказ не найден');
+    await ctx.answerCbQuery('❌ Заказ не найден (сервер перезапускался?)');
     return;
   }
   if (order.status !== 'pending') {
-    await ctx.answerCbQuery('Заказ уже обработан');
+    await ctx.answerCbQuery('⚠️ Заказ уже обработан');
     return;
   }
 
@@ -288,12 +296,12 @@ bot.action(/^fulfill_(.+)$/, async (ctx) => {
   order.code = code;
   orders.set(orderId, order);
 
-  // Убрать кнопки с сообщения
   try {
     await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
   } catch (e) {}
 
   await ctx.answerCbQuery('✅ Заказ подтверждён!');
+
   await ctx.reply(
     `✅ *Заказ #${orderId} подтверждён!*\n` +
     `👤 Email: ${order.email}\n` +
@@ -306,7 +314,7 @@ bot.action(/^fulfill_(.+)$/, async (ctx) => {
     try {
       await bot.telegram.sendMessage(
         order.chatId,
-        `🎉 *Заказ #${orderId} подтверждён!*\n\n` +
+        `🎉 *Ваш заказ #${orderId} подтверждён!*\n\n` +
         `Ваш код для передачи аккаунта:\n` +
         `\`${code}\`\n\n` +
         `Отправьте этот код продавцу: @brawlhelpp`,
@@ -318,28 +326,31 @@ bot.action(/^fulfill_(.+)$/, async (ctx) => {
   }
 });
 
+// =====================
+// КНОПКИ АДМИНА: ОТКЛОНИТЬ
+// =====================
 bot.action(/^reject_(.+)$/, async (ctx) => {
   const orderId = ctx.match[1];
   const order = orders.get(orderId);
 
   if (!order) {
-    await ctx.answerCbQuery('❌ Заказ не найден');
+    await ctx.answerCbQuery('❌ Заказ не найден (сервер перезапускался?)');
     return;
   }
   if (order.status !== 'pending') {
-    await ctx.answerCbQuery('Заказ уже обработан');
+    await ctx.answerCbQuery('⚠️ Заказ уже обработан');
     return;
   }
 
   order.status = 'rejected';
   orders.set(orderId, order);
 
-  // Убрать кнопки с сообщения
   try {
     await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
   } catch (e) {}
 
   await ctx.answerCbQuery('❌ Заказ отклонён');
+
   await ctx.reply(
     `❌ *Заказ #${orderId} отклонён.*\n` +
     `👤 Email: ${order.email}`,
@@ -363,6 +374,7 @@ bot.action(/^reject_(.+)$/, async (ctx) => {
 
 // =====================
 // EXPRESS СЕРВЕР + API
+// (нужен только чтобы Railway не убивал процесс)
 // =====================
 const app = express();
 app.use(express.json());
@@ -375,33 +387,13 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/', (req, res) => res.json({ ok: true, message: 'Bot server is running' }));
+app.get('/', (req, res) => res.json({ ok: true, message: 'Bot is running' }));
 
-app.post('/api/order', (req, res) => {
-  try {
-    const { email, accountId, accountTitle, price } = req.body;
-    if (!email || !accountId) return res.status(400).json({ error: 'email and accountId required' });
-
-    const orderId = generateOrderId();
-    const order = {
-      orderId,
-      email,
-      accountId,
-      accountTitle: accountTitle || accountId,
-      price: price || 0,
-      status: 'pending',
-      code: null,
-      chatId: null,
-      createdAt: new Date().toISOString(),
-    };
-    orders.set(orderId, order);
-
-    console.log(`Order created: ${orderId} for ${email}`);
-    res.json({ orderId, status: 'pending' });
-  } catch (e) {
-    console.error('POST /api/order error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+app.get('/api/orders', (req, res) => {
+  const list = Array.from(orders.values()).sort(
+    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+  );
+  res.json({ orders: list });
 });
 
 app.get('/api/order/:id', (req, res) => {
@@ -417,68 +409,12 @@ app.get('/api/order/:id', (req, res) => {
   });
 });
 
-app.get('/api/orders', (req, res) => {
-  const list = Array.from(orders.values()).sort(
-    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-  );
-  res.json({ orders: list });
-});
-
-app.post('/api/fulfill/:id', async (req, res) => {
-  const order = orders.get(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (order.status !== 'pending') return res.status(400).json({ error: 'Order is not pending' });
-
-  const code = req.body.code || crypto.randomBytes(6).toString('hex').toUpperCase();
-  order.status = 'fulfilled';
-  order.code = code;
-  orders.set(order.orderId, order);
-
-  if (order.chatId) {
-    try {
-      await bot.telegram.sendMessage(
-        order.chatId,
-        `🎉 *Заказ #${order.orderId} подтверждён!*\n\n` +
-        `Ваш код для передачи аккаунта:\n` +
-        `\`${code}\`\n\n` +
-        `Отправьте этот код продавцу: @brawlhelpp`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {
-      console.warn('Cannot notify buyer:', e.message);
-    }
-  }
-
-  res.json({ ok: true, orderId: order.orderId, code, status: 'fulfilled' });
-});
-
-app.post('/api/reject/:id', async (req, res) => {
-  const order = orders.get(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (order.status !== 'pending') return res.status(400).json({ error: 'Order is not pending' });
-
-  order.status = 'rejected';
-  orders.set(order.orderId, order);
-
-  if (order.chatId) {
-    try {
-      await bot.telegram.sendMessage(
-        order.chatId,
-        `❌ *Заказ #${order.orderId} отклонён.*\n\n` +
-        `Если вы уже перевели деньги, напишите продавцу: @brawlhelpp`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {
-      console.warn('Cannot notify buyer:', e.message);
-    }
-  }
-
-  res.json({ ok: true, orderId: order.orderId, status: 'rejected' });
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 bot.launch();
+console.log('✅ Bot started');
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
