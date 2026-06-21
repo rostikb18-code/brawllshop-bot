@@ -12,7 +12,7 @@ bot.use(session());
 // =====================
 // ХРАНИЛИЩЕ ЗАКАЗОВ (в памяти)
 // =====================
-const orders = new Map(); // orderId -> { orderId, email, accountId, accountTitle, price, status, code, chatId, createdAt }
+const orders = new Map();
 
 function generateOrderId() {
   return crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -58,10 +58,10 @@ function catalogKeyboard(index) {
     if (index > 0) navRow.push(Markup.button.callback('◀ Назад', `catalog_${index - 1}`));
     if (index < total - 1) navRow.push(Markup.button.callback('Вперёд ▶', `catalog_${index + 1}`));
   }
-  return Markup.inlineKeyboard([
-    navRow,
-    [Markup.button.callback(`🛒 Купить за ${formatPrice(ACCOUNTS[index].price)}`, `buy_${ACCOUNTS[index].id}`)],
-  ].filter(row => row.length > 0));
+  const rows = [];
+  if (navRow.length > 0) rows.push(navRow);
+  rows.push([Markup.button.callback(`🛒 Купить за ${formatPrice(ACCOUNTS[index].price)}`, `buy_${ACCOUNTS[index].id}`)]);
+  return Markup.inlineKeyboard(rows);
 }
 
 // =====================
@@ -229,6 +229,7 @@ bot.action('confirm_payment', async (ctx) => {
       { parse_mode: 'Markdown' }
     );
 
+    // ✅ УВЕДОМЛЕНИЕ АДМИНУ С КНОПКАМИ
     if (ADMIN_CHAT_ID) {
       await bot.telegram.sendMessage(
         ADMIN_CHAT_ID,
@@ -236,9 +237,16 @@ bot.action('confirm_payment', async (ctx) => {
         `👤 Email: ${email}\n` +
         `🎮 Аккаунт: ${account.title}\n` +
         `🏆 Кубки: ${account.trophies.toLocaleString('ru-RU')}\n` +
-        `💰 Цена: ${formatPrice(account.price)}\n\n` +
-        `Подтвердить через веб-панель.`,
-        { parse_mode: 'Markdown' }
+        `💰 Цена: ${formatPrice(account.price)}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ Подтвердить', callback_data: `fulfill_${orderId}` },
+              { text: '❌ Отклонить', callback_data: `reject_${orderId}` },
+            ]],
+          },
+        }
       );
     }
   } catch (e) {
@@ -260,12 +268,105 @@ bot.action('cancel_order', async (ctx) => {
 });
 
 // =====================
+// ✅ КНОПКИ АДМИНА: ПОДТВЕРДИТЬ / ОТКЛОНИТЬ
+// =====================
+bot.action(/^fulfill_(.+)$/, async (ctx) => {
+  const orderId = ctx.match[1];
+  const order = orders.get(orderId);
+
+  if (!order) {
+    await ctx.answerCbQuery('❌ Заказ не найден');
+    return;
+  }
+  if (order.status !== 'pending') {
+    await ctx.answerCbQuery('Заказ уже обработан');
+    return;
+  }
+
+  const code = crypto.randomBytes(6).toString('hex').toUpperCase();
+  order.status = 'fulfilled';
+  order.code = code;
+  orders.set(orderId, order);
+
+  // Убрать кнопки с сообщения
+  try {
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+  } catch (e) {}
+
+  await ctx.answerCbQuery('✅ Заказ подтверждён!');
+  await ctx.reply(
+    `✅ *Заказ #${orderId} подтверждён!*\n` +
+    `👤 Email: ${order.email}\n` +
+    `🔑 Код: \`${code}\``,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Уведомить покупателя
+  if (order.chatId) {
+    try {
+      await bot.telegram.sendMessage(
+        order.chatId,
+        `🎉 *Заказ #${orderId} подтверждён!*\n\n` +
+        `Ваш код для передачи аккаунта:\n` +
+        `\`${code}\`\n\n` +
+        `Отправьте этот код продавцу: @brawlhelpp`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.warn('Cannot notify buyer:', e.message);
+    }
+  }
+});
+
+bot.action(/^reject_(.+)$/, async (ctx) => {
+  const orderId = ctx.match[1];
+  const order = orders.get(orderId);
+
+  if (!order) {
+    await ctx.answerCbQuery('❌ Заказ не найден');
+    return;
+  }
+  if (order.status !== 'pending') {
+    await ctx.answerCbQuery('Заказ уже обработан');
+    return;
+  }
+
+  order.status = 'rejected';
+  orders.set(orderId, order);
+
+  // Убрать кнопки с сообщения
+  try {
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+  } catch (e) {}
+
+  await ctx.answerCbQuery('❌ Заказ отклонён');
+  await ctx.reply(
+    `❌ *Заказ #${orderId} отклонён.*\n` +
+    `👤 Email: ${order.email}`,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Уведомить покупателя
+  if (order.chatId) {
+    try {
+      await bot.telegram.sendMessage(
+        order.chatId,
+        `❌ *Заказ #${orderId} отклонён.*\n\n` +
+        `Если вы уже перевели деньги, напишите продавцу: @brawlhelpp`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.warn('Cannot notify buyer:', e.message);
+    }
+  }
+});
+
+// =====================
 // EXPRESS СЕРВЕР + API
 // =====================
 const app = express();
 app.use(express.json());
 
-// CORS — разрешаем miniapp обращаться к API
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -274,10 +375,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Проверка работы
 app.get('/', (req, res) => res.json({ ok: true, message: 'Bot server is running' }));
 
-// Создать заказ (из miniapp)
 app.post('/api/order', (req, res) => {
   try {
     const { email, accountId, accountTitle, price } = req.body;
@@ -305,7 +404,6 @@ app.post('/api/order', (req, res) => {
   }
 });
 
-// Получить статус заказа (из miniapp — polling)
 app.get('/api/order/:id', (req, res) => {
   const order = orders.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -319,7 +417,6 @@ app.get('/api/order/:id', (req, res) => {
   });
 });
 
-// Список всех заказов (для админки)
 app.get('/api/orders', (req, res) => {
   const list = Array.from(orders.values()).sort(
     (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
@@ -327,7 +424,6 @@ app.get('/api/orders', (req, res) => {
   res.json({ orders: list });
 });
 
-// Подтвердить заказ
 app.post('/api/fulfill/:id', async (req, res) => {
   const order = orders.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -338,7 +434,6 @@ app.post('/api/fulfill/:id', async (req, res) => {
   order.code = code;
   orders.set(order.orderId, order);
 
-  // Уведомить покупателя в Telegram (если заказ через бота)
   if (order.chatId) {
     try {
       await bot.telegram.sendMessage(
@@ -354,11 +449,9 @@ app.post('/api/fulfill/:id', async (req, res) => {
     }
   }
 
-  console.log(`Order fulfilled: ${order.orderId}, code: ${code}`);
   res.json({ ok: true, orderId: order.orderId, code, status: 'fulfilled' });
 });
 
-// Отклонить заказ
 app.post('/api/reject/:id', async (req, res) => {
   const order = orders.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -380,36 +473,12 @@ app.post('/api/reject/:id', async (req, res) => {
     }
   }
 
-  console.log(`Order rejected: ${order.orderId}`);
   res.json({ ok: true, orderId: order.orderId, status: 'rejected' });
-});
-
-// Уведомить покупателя вручную
-app.post('/notify', async (req, res) => {
-  const { chatId, orderId, code } = req.body;
-  if (!chatId || !orderId) return res.status(400).json({ error: 'chatId and orderId required' });
-
-  try {
-    await bot.telegram.sendMessage(
-      chatId,
-      `🎉 *Заказ #${orderId} подтверждён!*\n\n` +
-      `Ваш код:\n\`${code || 'Уточните у продавца'}\`\n\n` +
-      `Отправьте код продавцу: @brawlhelpp`,
-      { parse_mode: 'Markdown' }
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Notify error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-// =====================
-// ЗАПУСК БОТА
-// =====================
 bot.launch();
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
