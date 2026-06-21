@@ -68,7 +68,7 @@ function catalogKeyboard(index) {
 // СТАРТ
 // =====================
 bot.start(async (ctx) => {
-  ctx.session = ctx.session || {};
+  ctx.session = {};
   await ctx.reply(
     '👋 Привет! Это магазин аккаунтов Brawl Stars.\n\nВыбери действие:',
     Markup.keyboard([
@@ -118,7 +118,7 @@ bot.action(/^catalog_(\d+)$/, async (ctx) => {
 });
 
 // =====================
-// ПОКУПКА
+// ПОКУПКА — шаг 1: выбор аккаунта
 // =====================
 bot.action(/^buy_(.+)$/, async (ctx) => {
   const accountId = ctx.match[1];
@@ -127,41 +127,51 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
 
   ctx.session = ctx.session || {};
   ctx.session.selectedAccountId = account.id;
-  ctx.session.step = 'awaiting_email';
+  ctx.session.step = 'awaiting_payment_info';
 
   await ctx.answerCbQuery();
   await ctx.reply(
-    `✅ Вы выбрали: *${account.title}*\n💰 Цена: *${formatPrice(account.price)}*\n\n📧 Введите ваш email:`,
+    `✅ Вы выбрали: *${account.title}*\n` +
+    `💰 Цена: *${formatPrice(account.price)}*\n\n` +
+    `📱 *Реквизиты для оплаты (СБП):*\n` +
+    `📞 Номер: *+7 902 917-54-45*\n` +
+    `💳 Сумма: *${formatPrice(account.price)}*\n\n` +
+    `После оплаты введите ваше *полное имя и первую букву фамилии*\n` +
+    `_(например: Александр К)_\n\n` +
+    `⚠️ *ВАЖНО:* Укажите имя точно так, как вы указали в банке при переводе. Если имя не совпадёт — оплата не будет подтверждена!`,
     { parse_mode: 'Markdown' }
   );
 });
 
 // =====================
-// ОБРАБОТКА ТЕКСТА
+// ОБРАБОТКА ТЕКСТА (все шаги)
 // =====================
 bot.on('text', async (ctx) => {
   ctx.session = ctx.session || {};
   const text = ctx.message.text.trim();
   const step = ctx.session.step;
 
+  // --- Кнопки меню ---
   if (text === '❓ Помощь') {
     return ctx.reply(
       '📞 По вопросам покупки пишите: @brawlhelpp\n\n' +
       'Как это работает:\n' +
       '1️⃣ Выберите аккаунт в каталоге\n' +
-      '2️⃣ Введите email\n' +
-      '3️⃣ Переведите деньги по СБП\n' +
-      '4️⃣ Дождитесь подтверждения от продавца\n' +
-      '5️⃣ Получите код и отправьте продавцу'
+      '2️⃣ Оплатите через СБП\n' +
+      '3️⃣ Введите имя как в банке\n' +
+      '4️⃣ Дождитесь подтверждения\n' +
+      '5️⃣ Напишите email продавцу\n' +
+      '6️⃣ Получите код и передайте продавцу'
     );
   }
-
   if (text === '📋 Каталог аккаунтов') return;
 
-  if (step === 'awaiting_email') {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(text)) {
-      return ctx.reply('❌ Неверный формат email. Попробуйте ещё раз:');
+  // =====================
+  // ШАГ 1: Ввод имени после оплаты
+  // =====================
+  if (step === 'awaiting_payment_info') {
+    if (text.length < 3) {
+      return ctx.reply('❌ Введите полное имя и первую букву фамилии.\n_(например: Александр К)_', { parse_mode: 'Markdown' });
     }
 
     const account = getAccountById(ctx.session.selectedAccountId);
@@ -170,50 +180,14 @@ bot.on('text', async (ctx) => {
       return ctx.reply('❌ Аккаунт не найден. Начните заново — /start');
     }
 
-    ctx.session.email = text;
-    ctx.session.step = 'awaiting_payment';
+    ctx.session.buyerName = text;
+    ctx.session.step = 'awaiting_admin_confirm';
 
-    await ctx.reply(
-      `📱 *Оплата через СБП*\n\n` +
-      `Переведите *${formatPrice(account.price)}* на номер:\n` +
-      `📞 *+7 902 917-54-45*\n\n` +
-      `После перевода нажмите кнопку ниже 👇`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('✅ Я оплатил', 'confirm_payment')],
-          [Markup.button.callback('❌ Отмена', 'cancel_order')],
-        ]),
-      }
-    );
-    return;
-  }
-
-  if (step === 'awaiting_confirmation') {
-    return ctx.reply('⏳ Ваш заказ на проверке. Ожидайте подтверждения от продавца.');
-  }
-});
-
-// =====================
-// ПОДТВЕРЖДЕНИЕ ОПЛАТЫ
-// =====================
-bot.action('confirm_payment', async (ctx) => {
-  ctx.session = ctx.session || {};
-  const account = getAccountById(ctx.session.selectedAccountId);
-  const email = ctx.session.email;
-
-  if (!account || !email) {
-    await ctx.answerCbQuery();
-    return ctx.reply('❌ Сессия истекла. Начните заново — /start');
-  }
-
-  await ctx.answerCbQuery('Создаём заказ...');
-
-  try {
     const orderId = generateOrderId();
     const order = {
       orderId,
-      email,
+      buyerName: text,
+      email: null,
       accountId: account.id,
       accountTitle: account.title,
       price: account.price,
@@ -223,60 +197,108 @@ bot.action('confirm_payment', async (ctx) => {
       createdAt: new Date().toISOString(),
     };
     orders.set(orderId, order);
-
     ctx.session.orderId = orderId;
-    ctx.session.step = 'awaiting_confirmation';
 
     await ctx.reply(
-      `✅ *Заказ #${orderId} создан!*\n\n` +
-      `Продавец проверит оплату и подтвердит заказ.\n` +
-      `Вы получите уведомление здесь в Telegram.\n\n` +
-      `По вопросам: @brawlhelpp`,
+      `✅ *Спасибо, ${text}!*\n\n` +
+      `Заказ *#${orderId}* создан.\n` +
+      `Продавец проверит ваш платёж по имени и подтвердит заказ.\n\n` +
+      `⏳ Ожидайте подтверждения...`,
       { parse_mode: 'Markdown' }
     );
 
-    // ✅ УВЕДОМЛЕНИЕ АДМИНУ С КНОПКАМИ
+    // Уведомление админу
     if (ADMIN_CHAT_ID) {
-      await bot.telegram.sendMessage(
-        ADMIN_CHAT_ID,
-        `🆕 *Новый заказ #${orderId}*\n\n` +
-        `👤 Email: ${email}\n` +
-        `🎮 Аккаунт: ${account.title}\n` +
-        `🏆 Кубки: ${account.trophies.toLocaleString('ru-RU')}\n` +
-        `💰 Цена: ${formatPrice(account.price)}`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '✅ Подтвердить', callback_data: `fulfill_${orderId}` },
-              { text: '❌ Отклонить', callback_data: `reject_${orderId}` },
-            ]],
-          },
-        }
-      );
+      try {
+        await bot.telegram.sendMessage(
+          ADMIN_CHAT_ID,
+          `🆕 *Новый заказ #${orderId}*\n\n` +
+          `👤 Имя плательщика: *${text}*\n` +
+          `🎮 Аккаунт: ${account.title}\n` +
+          `🏆 Кубки: ${account.trophies.toLocaleString('ru-RU')}\n` +
+          `💰 Цена: ${formatPrice(account.price)}\n\n` +
+          `🔍 Проверьте перевод по имени и подтвердите заказ:`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: '✅ Подтвердить', callback_data: `fulfill_${orderId}` },
+                { text: '❌ Отклонить', callback_data: `reject_${orderId}` },
+              ]],
+            },
+          }
+        );
+      } catch (e) {
+        console.warn('Cannot notify admin:', e.message);
+      }
+    }
+    return;
+  }
+
+  // =====================
+  // ШАГ 2: Ожидание подтверждения от админа
+  // =====================
+  if (step === 'awaiting_admin_confirm') {
+    return ctx.reply('⏳ Ваш заказ на проверке. Пожалуйста, дождитесь подтверждения от продавца.');
+  }
+
+  // =====================
+  // ШАГ 3: Ввод email после подтверждения
+  // =====================
+  if (step === 'awaiting_email') {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(text)) {
+      return ctx.reply('❌ Неверный формат email.\n_(например: example@mail.ru)_\n\nПопробуйте ещё раз:', { parse_mode: 'Markdown' });
     }
 
-  } catch (e) {
-    console.error('Create order error:', e.message);
-    ctx.session.step = null;
-    await ctx.reply('❌ Не удалось создать заказ. Попробуйте позже или напишите @brawlhelpp');
+    const orderId = ctx.session.orderId;
+    const order = orders.get(orderId);
+    if (!order) {
+      ctx.session.step = null;
+      return ctx.reply('❌ Заказ не найден. Напишите @brawlhelpp');
+    }
+
+    order.email = text;
+    orders.set(orderId, order);
+    ctx.session.email = text;
+    ctx.session.step = 'awaiting_code_sent';
+
+    await ctx.reply(
+      `📧 Email принят: *${text}*\n\n` +
+      `Продавец получил ваш email и скоро пришлёт код для передачи аккаунта.\n` +
+      `⏳ Ожидайте...`,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Уведомить админа что покупатель ввёл email
+    if (ADMIN_CHAT_ID) {
+      try {
+        await bot.telegram.sendMessage(
+          ADMIN_CHAT_ID,
+          `📧 *Заказ #${orderId}* — покупатель указал email:\n\n` +
+          `👤 Имя: ${order.buyerName}\n` +
+          `📧 Email: *${text}*\n\n` +
+          `Введите код для передачи аккаунта командой:\n` +
+          `/setcode ${orderId} КОД`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (e) {
+        console.warn('Cannot notify admin:', e.message);
+      }
+    }
+    return;
+  }
+
+  // =====================
+  // ШАГ 4: Ожидание кода
+  // =====================
+  if (step === 'awaiting_code_sent') {
+    return ctx.reply('⏳ Продавец готовит ваш код. Совсем скоро!');
   }
 });
 
 // =====================
-// ОТМЕНА
-// =====================
-bot.action('cancel_order', async (ctx) => {
-  ctx.session = ctx.session || {};
-  ctx.session.step = null;
-  ctx.session.selectedAccountId = null;
-  ctx.session.email = null;
-  await ctx.answerCbQuery('Отменено');
-  await ctx.reply('❌ Заказ отменён. Напишите /start чтобы начать заново.');
-});
-
-// =====================
-// КНОПКИ АДМИНА: ПОДТВЕРДИТЬ
+// КНОПКА АДМИНА: ПОДТВЕРДИТЬ
 // =====================
 bot.action(/^fulfill_(.+)$/, async (ctx) => {
   const orderId = ctx.match[1];
@@ -291,35 +313,36 @@ bot.action(/^fulfill_(.+)$/, async (ctx) => {
     return;
   }
 
-  const code = crypto.randomBytes(6).toString('hex').toUpperCase();
-  order.status = 'fulfilled';
-  order.code = code;
+  order.status = 'confirmed';
   orders.set(orderId, order);
 
   try {
     await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
   } catch (e) {}
 
-  await ctx.answerCbQuery('✅ Заказ подтверждён!');
-
+  await ctx.answerCbQuery('✅ Оплата подтверждена!');
   await ctx.reply(
-    `✅ *Заказ #${orderId} подтверждён!*\n` +
-    `👤 Email: ${order.email}\n` +
-    `🔑 Код: \`${code}\``,
+    `✅ *Заказ #${orderId} подтверждён.*\n` +
+    `👤 Имя: ${order.buyerName}\n\n` +
+    `Покупатель получил запрос на email.`,
     { parse_mode: 'Markdown' }
   );
 
-  // Уведомить покупателя
+  // Попросить покупателя ввести email
   if (order.chatId) {
     try {
       await bot.telegram.sendMessage(
         order.chatId,
-        `🎉 *Ваш заказ #${orderId} подтверждён!*\n\n` +
-        `Ваш код для передачи аккаунта:\n` +
-        `\`${code}\`\n\n` +
-        `Отправьте этот код продавцу: @brawlhelpp`,
+        `🎉 *Оплата подтверждена!*\n\n` +
+        `Теперь напишите продавцу ваш *email* прямо здесь в чат:\n` +
+        `_(например: example@mail.ru)_\n\n` +
+        `На него будут отправлены детали заказа.`,
         { parse_mode: 'Markdown' }
       );
+
+      // Обновить шаг в сессии покупателя
+      // (сессия хранится по chatId, нужно обновить через Map)
+      pendingEmailByChatId.set(String(order.chatId), orderId);
     } catch (e) {
       console.warn('Cannot notify buyer:', e.message);
     }
@@ -327,7 +350,7 @@ bot.action(/^fulfill_(.+)$/, async (ctx) => {
 });
 
 // =====================
-// КНОПКИ АДМИНА: ОТКЛОНИТЬ
+// КНОПКА АДМИНА: ОТКЛОНИТЬ
 // =====================
 bot.action(/^reject_(.+)$/, async (ctx) => {
   const orderId = ctx.match[1];
@@ -350,20 +373,19 @@ bot.action(/^reject_(.+)$/, async (ctx) => {
   } catch (e) {}
 
   await ctx.answerCbQuery('❌ Заказ отклонён');
-
   await ctx.reply(
     `❌ *Заказ #${orderId} отклонён.*\n` +
-    `👤 Email: ${order.email}`,
+    `👤 Имя: ${order.buyerName}`,
     { parse_mode: 'Markdown' }
   );
 
-  // Уведомить покупателя
   if (order.chatId) {
     try {
       await bot.telegram.sendMessage(
         order.chatId,
         `❌ *Заказ #${orderId} отклонён.*\n\n` +
-        `Если вы уже перевели деньги, напишите продавцу: @brawlhelpp`,
+        `Оплата не найдена или имя не совпало.\n` +
+        `Если вы уже перевели деньги — напишите: @brawlhelpp`,
         { parse_mode: 'Markdown' }
       );
     } catch (e) {
@@ -373,8 +395,76 @@ bot.action(/^reject_(.+)$/, async (ctx) => {
 });
 
 // =====================
-// EXPRESS СЕРВЕР + API
-// (нужен только чтобы Railway не убивал процесс)
+// КОМАНДА АДМИНА: /setcode ORDERID КОД
+// =====================
+const pendingEmailByChatId = new Map();
+
+bot.command('setcode', async (ctx) => {
+  if (String(ctx.chat.id) !== String(ADMIN_CHAT_ID)) return;
+
+  const parts = ctx.message.text.split(' ');
+  if (parts.length < 3) {
+    return ctx.reply('❌ Использование: /setcode ORDERID КОД');
+  }
+
+  const orderId = parts[1].toUpperCase();
+  const code = parts.slice(2).join(' ');
+  const order = orders.get(orderId);
+
+  if (!order) {
+    return ctx.reply(`❌ Заказ #${orderId} не найден.`);
+  }
+  if (!order.email) {
+    return ctx.reply(`⚠️ Покупатель ещё не ввёл email для заказа #${orderId}.`);
+  }
+
+  order.code = code;
+  order.status = 'fulfilled';
+  orders.set(orderId, order);
+
+  await ctx.reply(
+    `✅ Код для заказа #${orderId} установлен.\nПокупатель получит уведомление.`,
+  );
+
+  // Отправить код покупателю
+  if (order.chatId) {
+    try {
+      await bot.telegram.sendMessage(
+        order.chatId,
+        `🎉 *Ваш код готов!*\n\n` +
+        `Код для передачи аккаунта:\n` +
+        `\`${code}\`\n\n` +
+        `Отправьте этот код продавцу: @brawlhelpp\n` +
+        `После этого аккаунт будет передан вам! 🏆`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.warn('Cannot send code to buyer:', e.message);
+    }
+  }
+});
+
+// =====================
+// MIDDLEWARE: перехват email после подтверждения
+// (на случай если сессия сбросилась)
+// =====================
+// Уже обрабатывается через step === 'awaiting_email' в bot.on('text')
+// pendingEmailByChatId используется как резервный механизм
+bot.use(async (ctx, next) => {
+  if (ctx.message?.text && ctx.session) {
+    const chatId = String(ctx.chat?.id);
+    const orderId = pendingEmailByChatId.get(chatId);
+    if (orderId && !ctx.session.step) {
+      ctx.session.step = 'awaiting_email';
+      ctx.session.orderId = orderId;
+      pendingEmailByChatId.delete(chatId);
+    }
+  }
+  return next();
+});
+
+// =====================
+// EXPRESS + API
 // =====================
 const app = express();
 app.use(express.json());
@@ -417,4 +507,3 @@ console.log('✅ Bot started');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
