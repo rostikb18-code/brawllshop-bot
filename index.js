@@ -9,6 +9,7 @@ const { simpleParser } = require('mailparser');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const SHOP_EMAIL_ADDRESS = process.env.SHOP_EMAIL;
 
 // =====================
 // БАЗА ДАННЫХ
@@ -265,7 +266,6 @@ function getSupercellCode() {
       imap.openBox('INBOX', false, (err) => {
         if (err) { imap.end(); return reject(err); }
 
-        // Ищем непрочитанные письма от Supercell за последние 15 минут
         const since = new Date(Date.now() - 15 * 60 * 1000);
 
         imap.search(
@@ -276,7 +276,6 @@ function getSupercellCode() {
               return reject(new Error('📭 Письмо от Supercell не найдено. Попросите покупателя снова запросить код входа.'));
             }
 
-            // Берём самое последнее письмо
             const latest = [results[results.length - 1]];
             const fetch = imap.fetch(latest, { bodies: '' });
 
@@ -294,7 +293,6 @@ function getSupercellCode() {
                   const html = parsed.html || '';
                   const fullText = text + ' ' + html;
 
-                  // ❌ СНАЧАЛА — отклоняем письма со сменой почты
                   const isDangerous =
                     subject.includes('смену адреса') ||
                     subject.includes('смену электронной') ||
@@ -312,7 +310,6 @@ function getSupercellCode() {
                     return;
                   }
 
-                  // ✅ Разрешаем только письма с кодом входа
                   const isLoginEmail =
                     subject.includes('хочет загрузить') ||
                     subject.includes('игровые достижения') ||
@@ -331,7 +328,6 @@ function getSupercellCode() {
                     return;
                   }
 
-                  // Извлекаем 6-значный код (форматы: "825 988", "825988", "8 2 5 9 8 8")
                   const codeMatch = fullText.match(/\b(\d[\s]?\d[\s]?\d[\s]?\d[\s]?\d[\s]?\d)\b/);
                   if (!codeMatch) {
                     imap.end();
@@ -343,8 +339,6 @@ function getSupercellCode() {
                   }
 
                   const code = codeMatch[1].replace(/\s/g, '');
-
-                  // Помечаем письмо как прочитанное
                   imap.addFlags(latest, '\\Seen', () => {});
                   imap.end();
 
@@ -436,6 +430,9 @@ const pendingMainMsgStore = new Map();
 const pendingLastOrderStore = new Map();
 const verifiedAdmins = new Set();
 
+// Map для хранения ID сообщений "🔒 Введите /login пароль"
+const lockMsgStore = new Map();
+
 function isAdmin(ctx) {
   return String(ctx.chat?.id) === String(ADMIN_CHAT_ID) && verifiedAdmins.has(String(ctx.chat?.id));
 }
@@ -470,6 +467,32 @@ async function tempMsg(chatId, text, delay = 4000) {
     const sent = await bot.telegram.sendMessage(chatId, text);
     setTimeout(() => bot.telegram.deleteMessage(chatId, sent.message_id).catch(() => {}), delay);
   } catch (e) {}
+}
+
+// Постоянное сообщение с кнопкой "✖ Закрыть" — висит пока не удалишь
+async function lockMsg(chatId, text) {
+  const prevId = lockMsgStore.get(String(chatId));
+  if (prevId) {
+    try { await bot.telegram.deleteMessage(chatId, prevId); } catch (e) {}
+    lockMsgStore.delete(String(chatId));
+  }
+  try {
+    const sent = await bot.telegram.sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: '✖ Закрыть', callback_data: 'close_lock_msg' }]],
+      },
+    });
+    lockMsgStore.set(String(chatId), sent.message_id);
+  } catch (e) {}
+}
+
+// Удалить lock-сообщение
+async function deleteLockMsg(chatId) {
+  const msgId = lockMsgStore.get(String(chatId));
+  if (msgId) {
+    try { await bot.telegram.deleteMessage(chatId, msgId); } catch (e) {}
+    lockMsgStore.delete(String(chatId));
+  }
 }
 
 async function notifyAdmin(text, keyboard) {
@@ -628,6 +651,28 @@ function screenRentPayment(account, days, price) {
       inline_keyboard: [
         [{ text: '✅ Я оплатил', callback_data: `rentpaid_${account.id}_${days}` }],
         [{ text: '◀ Назад', callback_data: `rent_${account.id}` }],
+      ],
+    },
+  };
+}
+
+// Экран аренды: показываем почту магазина покупателю
+function screenRentEnterShopEmail(accountTitle, orderId) {
+  return {
+    type: 'text',
+    text:
+      `✅ *Оплата подтверждена\\!*\n\n` +
+      `🏆 *${escapeMarkdown(accountTitle)}*\n\n` +
+      `Теперь выполните следующие шаги:\n\n` +
+      `1️⃣ Откройте Brawl Stars\n` +
+      `2️⃣ Настройки → Supercell ID\n` +
+      `3️⃣ Введите эту почту:\n\n` +
+      `📧 \`${escapeMarkdown(SHOP_EMAIL_ADDRESS)}\`\n\n` +
+      `4️⃣ Нажмите *"Отправить код"* в игре\n` +
+      `5️⃣ Затем нажмите кнопку ниже 👇`,
+    keyboard: {
+      inline_keyboard: [
+        [{ text: '📨 Я нажал — получить код', callback_data: `getrentcode_${orderId}` }],
       ],
     },
   };
@@ -975,6 +1020,7 @@ bot.command('login', async (ctx) => {
   try { await ctx.deleteMessage(); } catch (e) {}
   if (password === ADMIN_PASSWORD) {
     verifiedAdmins.add(String(ctx.chat.id));
+    await deleteLockMsg(ctx.chat.id); // удаляем lock-сообщение при успешном входе
     await ctx.reply('✅ Вы вошли как администратор. Все кнопки активны.');
   } else {
     await ctx.reply('❌ Неверный пароль.');
@@ -1321,6 +1367,135 @@ bot.action(/^rentpaid_(.+)_(\d+)$/, async (ctx) => {
 });
 
 // =====================
+// КНОПКА "ПОЛУЧИТЬ КОД" ДЛЯ АРЕНДЫ
+// =====================
+bot.action(/^getrentcode_(.+)$/, async (ctx) => {
+  ctx.session = ctx.session || {};
+  const orderId = ctx.match[1];
+  const order = ordersDb.get(orderId);
+
+  if (!order) {
+    await ctx.answerCbQuery('❌ Заказ не найден');
+    return;
+  }
+
+  // Защита от спама — не чаще 3 раз за 2 минуты
+  if (spamDb.check(String(ctx.chat.id), 'getrentcode', 3, 2)) {
+    await ctx.answerCbQuery('⏳ Подождите немного перед повторной попыткой');
+    return;
+  }
+  spamDb.log(String(ctx.chat.id), 'getrentcode');
+
+  await ctx.answerCbQuery('📨 Читаю письмо...');
+
+  // Убираем кнопки с предыдущего сообщения
+  try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
+
+  // Сообщение загрузки
+  const loadingMsg = await bot.telegram.sendMessage(
+    ctx.chat.id,
+    `⏳ *Читаю письмо от Supercell\\.\\.\\.*\n\nПодождите несколько секунд\\.`,
+    { parse_mode: 'MarkdownV2' }
+  );
+
+  try {
+    const code = await getSupercellCode();
+
+    // Удаляем сообщение загрузки
+    try { await bot.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
+
+    const rentUntil = rentUntilDate(order.rent_days || 1);
+
+    // Сохраняем код и завершаем заказ
+    ordersDb.update(orderId, {
+      status: 'fulfilled',
+      code: code,
+      rent_until: rentUntil,
+    });
+
+    usersDb.incrementOrders(String(order.buyer_chat_id));
+
+    // Реферальный бонус
+    if (order.referred_by) {
+      usersDb.addDiscount(order.referred_by, 100);
+      try {
+        await bot.telegram.sendMessage(
+          Number(order.referred_by),
+          `🎁 По вашей реферальной ссылке совершили покупку\\!\n\nВы получили скидку *100 ₽* на следующую покупку\\.`,
+          { parse_mode: 'MarkdownV2' }
+        );
+      } catch (e) {}
+    }
+
+    // Отправляем код покупателю
+    const sent = await bot.telegram.sendMessage(
+      ctx.chat.id,
+      `🎉 *Аренда активирована\\!*\n\n` +
+      `🏆 *${escapeMarkdown(order.account_title)}*\n\n` +
+      `Введите этот код в игру:\n\n` +
+      `🔑 \`${escapeMarkdown(code)}\`\n\n` +
+      `⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*\n\n` +
+      `По вопросам: @brawlhelpp`,
+      {
+        parse_mode: 'MarkdownV2',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '⭐ Оставить отзыв', callback_data: 'leave_review' }],
+            [{ text: '🏠 В каталог', callback_data: 'back_catalog' }],
+          ],
+        },
+      }
+    );
+    pendingMainMsgStore.set(String(ctx.chat.id), sent.message_id);
+    pendingLastOrderStore.set(String(ctx.chat.id), orderId);
+    ctx.session.lastOrderId = orderId;
+
+    // Уведомляем админа
+    await notifyAdmin(
+      `✅ *Аренда завершена автоматически*\n\n` +
+      `Заказ: *\\#${escapeMarkdown(orderId)}*\n` +
+      `👤 ${escapeMarkdown(order.buyer_name)}\n` +
+      `🎮 ${escapeMarkdown(order.account_title)}\n` +
+      `🔑 Код: *${escapeMarkdown(code)}*\n` +
+      `⏱ До: *${escapeMarkdown(formatDate(rentUntil))}*`
+    );
+
+  } catch (err) {
+    console.error('[Gmail RENT ERROR]', err.message);
+
+    // Удаляем сообщение загрузки
+    try { await bot.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
+
+    // Показываем ошибку с кнопкой попробовать снова
+    const sent = await bot.telegram.sendMessage(
+      ctx.chat.id,
+      `❌ *Не удалось получить код:*\n\n${escapeMarkdown(err.message)}\n\n` +
+      `Подождите 1\\-2 минуты и попробуйте снова\\.\n` +
+      `Убедитесь что нажали *"Отправить код"* в игре\\.`,
+      {
+        parse_mode: 'MarkdownV2',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 Попробовать снова', callback_data: `getrentcode_${orderId}` }],
+            [{ text: '📞 Написать продавцу', url: 'https://t.me/brawlhelpp' }],
+          ],
+        },
+      }
+    );
+    pendingMainMsgStore.set(String(ctx.chat.id), sent.message_id);
+
+    // Уведомляем админа об ошибке
+    await notifyAdmin(
+      `⚠️ *Ошибка чтения кода для аренды*\n\n` +
+      `Заказ: *\\#${escapeMarkdown(orderId)}*\n` +
+      `👤 ${escapeMarkdown(order.buyer_name)}\n` +
+      `❌ ${escapeMarkdown(err.message)}`,
+      [[{ text: '✅ Завершить вручную', callback_data: `complete_${orderId}` }]]
+    );
+  }
+});
+
+// =====================
 // КНОПКИ ОТЗЫВОВ
 // =====================
 bot.action('leave_review', async (ctx) => {
@@ -1357,6 +1532,14 @@ bot.action('skip_review', async (ctx) => {
 });
 
 // =====================
+// КНОПКА "ЗАКРЫТЬ" LOCK-СООБЩЕНИЯ
+// =====================
+bot.action('close_lock_msg', async (ctx) => {
+  await ctx.answerCbQuery();
+  await deleteLockMsg(ctx.chat.id);
+});
+
+// =====================
 // КНОПКИ РЕФЕРАЛА
 // =====================
 bot.hears('🔗 Моя реферальная ссылка', async (ctx) => {
@@ -1374,15 +1557,17 @@ bot.hears('🔗 Моя реферальная ссылка', async (ctx) => {
 });
 
 // =====================
-// КНОПКИ АДМИНА
+// КНОПКИ АДМИНА (с lockMsg вместо tempMsg)
 // =====================
 bot.hears('📊 Статистика', async (ctx) => {
-  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await deleteLockMsg(ctx.chat.id);
+  if (!isAdmin(ctx)) return lockMsg(ctx.chat.id, '🔒 Введите /login пароль');
   await showStats(ctx);
 });
 
 bot.hears('📦 Все заказы', async (ctx) => {
-  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await deleteLockMsg(ctx.chat.id);
+  if (!isAdmin(ctx)) return lockMsg(ctx.chat.id, '🔒 Введите /login пароль');
   const all = ordersDb.getRecent(20);
   const active = ordersDb.getActive();
   if (all.length === 0) return ctx.reply('📭 Заказов пока нет.');
@@ -1407,12 +1592,14 @@ bot.hears('📦 Все заказы', async (ctx) => {
 });
 
 bot.hears('⭐ Отзывы', async (ctx) => {
-  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await deleteLockMsg(ctx.chat.id);
+  if (!isAdmin(ctx)) return lockMsg(ctx.chat.id, '🔒 Введите /login пароль');
   await showReviews(ctx);
 });
 
 bot.hears('🗂 Мои аккаунты', async (ctx) => {
-  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await deleteLockMsg(ctx.chat.id);
+  if (!isAdmin(ctx)) return lockMsg(ctx.chat.id, '🔒 Введите /login пароль');
   await showAccounts(ctx);
 });
 
@@ -1463,7 +1650,8 @@ bot.hears('❓ Помощь', async (ctx) => {
 });
 
 bot.hears('➕ Добавить аккаунт', async (ctx) => {
-  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await deleteLockMsg(ctx.chat.id);
+  if (!isAdmin(ctx)) return lockMsg(ctx.chat.id, '🔒 Введите /login пароль');
   ctx.session = ctx.session || {};
   ctx.session.step = 'admin_add_title';
   await ctx.reply(
@@ -1734,7 +1922,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Ввод email
+  // Ввод email (только для покупки, не для аренды)
   if (step === 'awaiting_email') {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
       await tempMsg(chatId, '❌ Неверный формат email.\nНапример: example@mail.ru');
@@ -1820,7 +2008,7 @@ bot.on('text', async (ctx) => {
 });
 
 // =====================
-// ДЕЙСТВИЯ АДМИНА (handleFulfill — ТЕПЕРЬ С АВТОЧТЕНИЕМ GMAIL)
+// ДЕЙСТВИЯ АДМИНА
 // =====================
 async function handleFulfill(ctx, orderId) {
   const order = ordersDb.get(orderId);
@@ -1833,24 +2021,45 @@ async function handleFulfill(ctx, orderId) {
   ordersDb.update(orderId, { status: 'confirmed' });
 
   if (order.type === 'rent') {
+    // Для аренды — сразу отправляем почту магазина, email не спрашиваем
     accountsDb.setRented(order.account_id, true);
-  }
 
-  pendingEmailByChatId.set(String(order.buyer_chat_id), orderId);
-
-  await ctx.reply(
-    `✅ Заказ *\\#${escapeMarkdown(orderId)}* подтверждён\\. Ожидаю email от покупателя\\.`,
-    { parse_mode: 'MarkdownV2' }
-  );
-
-  try {
-    const sent = await bot.telegram.sendMessage(
-      Number(order.buyer_chat_id),
-      `🎉 *Оплата подтверждена\\!*\n\nЗаказ: *\\#${escapeMarkdown(orderId)}*\n\nНапишите ваш *email* прямо сюда в чат:\n_Например: example@mail\\.ru_`,
+    await ctx.reply(
+      `✅ Заказ *\\#${escapeMarkdown(orderId)}* подтверждён\\. Отправляю почту покупателю\\.`,
       { parse_mode: 'MarkdownV2' }
     );
-    pendingMainMsgStore.set(String(order.buyer_chat_id), sent.message_id);
-  } catch (e) { console.warn(e.message); }
+
+    try {
+      const screen = screenRentEnterShopEmail(order.account_title, orderId);
+      const sent = await bot.telegram.sendMessage(
+        Number(order.buyer_chat_id),
+        screen.text,
+        {
+          parse_mode: 'MarkdownV2',
+          reply_markup: screen.keyboard,
+        }
+      );
+      pendingMainMsgStore.set(String(order.buyer_chat_id), sent.message_id);
+    } catch (e) { console.warn(e.message); }
+
+  } else {
+    // Для покупки — спрашиваем email как раньше
+    pendingEmailByChatId.set(String(order.buyer_chat_id), orderId);
+
+    await ctx.reply(
+      `✅ Заказ *\\#${escapeMarkdown(orderId)}* подтверждён\\. Ожидаю email от покупателя\\.`,
+      { parse_mode: 'MarkdownV2' }
+    );
+
+    try {
+      const sent = await bot.telegram.sendMessage(
+        Number(order.buyer_chat_id),
+        `🎉 *Оплата подтверждена\\!*\n\nЗаказ: *\\#${escapeMarkdown(orderId)}*\n\nНапишите ваш *email* прямо сюда в чат:\n_Например: example@mail\\.ru_`,
+        { parse_mode: 'MarkdownV2' }
+      );
+      pendingMainMsgStore.set(String(order.buyer_chat_id), sent.message_id);
+    } catch (e) { console.warn(e.message); }
+  }
 }
 
 async function handleReject(ctx, orderId) {
@@ -1878,9 +2087,6 @@ async function handleReject(ctx, orderId) {
   }
 }
 
-// =====================
-// handleComplete — АВТОМАТИЧЕСКИ ЧИТАЕТ КОД ИЗ GMAIL
-// =====================
 async function handleComplete(ctx, orderId) {
   const order = ordersDb.get(orderId);
   if (!order) { await ctx.reply(`❌ Заказ #${orderId} не найден.`); return; }
@@ -1889,8 +2095,6 @@ async function handleComplete(ctx, orderId) {
     return;
   }
 
-  // Если код уже есть от покупателя — используем его
-  // Если нет — читаем из Gmail автоматически
   let finalCode = order.code || null;
 
   if (!finalCode) {
@@ -1923,7 +2127,6 @@ async function handleComplete(ctx, orderId) {
 
   usersDb.incrementOrders(String(order.buyer_chat_id));
 
-  // Реферальный бонус
   if (order.referred_by) {
     usersDb.addDiscount(order.referred_by, 100);
     try {
