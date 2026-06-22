@@ -76,15 +76,21 @@ db.exec(`
     action TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    chat_id TEXT PRIMARY KEY,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 
-// Миграция
+// Миграции
 try { db.exec(`ALTER TABLE accounts ADD COLUMN rent_price_day INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE accounts ADD COLUMN rent_price_week INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE accounts ADD COLUMN rented INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE orders ADD COLUMN type TEXT DEFAULT 'buy'`); } catch(e) {}
 try { db.exec(`ALTER TABLE orders ADD COLUMN rent_days INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE orders ADD COLUMN rent_until TEXT`); } catch(e) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS admin_sessions (chat_id TEXT PRIMARY KEY, created_at TEXT DEFAULT (datetime('now')))`); } catch(e) {}
 
 // Стартовый аккаунт
 const existingAccounts = db.prepare('SELECT COUNT(*) as count FROM accounts').get();
@@ -244,10 +250,26 @@ const spamDb = {
   },
 };
 
+// =====================
+// ADMIN SESSIONS (хранятся в БД — не слетают при рестарте)
+// =====================
+const adminSessionsDb = {
+  isVerified(chatId) {
+    return !!db.prepare('SELECT 1 FROM admin_sessions WHERE chat_id = ?').get(String(chatId));
+  },
+  add(chatId) {
+    db.prepare('INSERT OR REPLACE INTO admin_sessions (chat_id) VALUES (?)').run(String(chatId));
+  },
+  remove(chatId) {
+    db.prepare('DELETE FROM admin_sessions WHERE chat_id = ?').run(String(chatId));
+  },
+};
+
 setInterval(() => spamDb.cleanup(), 60 * 60 * 1000);
 
 // =====================
-// GMAIL IMAP — ЧИТАЕМ КОД АВТОМАТИЧЕСКИ
+// GMAIL IMAP — ИСПРАВЛЕННАЯ ВЕРСИЯ
+// Ищет за 2 часа (не только UNSEEN), проверяет INBOX + All Mail
 // =====================
 function getSupercellCode() {
   return new Promise((resolve, reject) => {
@@ -258,156 +280,185 @@ function getSupercellCode() {
       port: 993,
       tls: true,
       tlsOptions: { rejectUnauthorized: false },
+      authTimeout: 10000,
     });
 
     let resolved = false;
 
-    imap.once('ready', () => {
-      console.log('[Gmail] Подключились к IMAP');
-      imap.openBox('INBOX', false, (err) => {
+    function done(err, value) {
+      if (resolved) return;
+      resolved = true;
+      try { imap.end(); } catch (e) {}
+      if (err) reject(err);
+      else resolve(value);
+    }
+
+    // Парсим письмо и извлекаем код
+    function parseAndExtractCode(stream) {
+      return new Promise((res, rej) => {
+        simpleParser(stream, (err, parsed) => {
+          if (err) return rej(err);
+
+          const subject = parsed.subject || '';
+          const text = parsed.text || '';
+          const html = parsed.html || '';
+          const fullText = text + ' ' + html;
+
+          console.log('[Gmail] Subject:', subject);
+          console.log('[Gmail] Text preview:', text.slice(0, 400));
+
+          // Опасные письма — пропускаем
+          const isDangerous =
+            subject.toLowerCase().includes('смену адреса') ||
+            subject.toLowerCase().includes('смену электронной') ||
+            fullText.includes('смену адреса электронной почты') ||
+            fullText.includes('запрос на смену') ||
+            fullText.includes('изменить адрес электронной почты') ||
+            fullText.includes('change your email');
+
+          if (isDangerous) {
+            return rej(new Error('⛔ Это письмо о смене почты — код не выдаётся в целях безопасности.'));
+          }
+
+          // Ищем 6-значный код всеми способами
+          // Способ 1: обычный блок из 6 цифр
+          let codeMatch = fullText.match(/\b(\d{6})\b/);
+
+          // Способ 2: цифры через пробел "1 2 3 4 5 6"
+          if (!codeMatch) {
+            const spaced = fullText.match(/(\d)\s(\d)\s(\d)\s(\d)\s(\d)\s(\d)/);
+            if (spaced) codeMatch = [spaced[0]];
+          }
+
+          // Способ 3: через дефис или пробел "123 456" или "123-456"
+          if (!codeMatch) {
+            const dashed = fullText.match(/(\d{3})[\s\-](\d{3})/);
+            if (dashed) codeMatch = [dashed[0]];
+          }
+
+          console.log('[Gmail] codeMatch:', codeMatch ? codeMatch[0] : 'не найден');
+
+          if (!codeMatch) {
+            return rej(new Error('🔍 Код не найден в письме. Подождите 1-2 минуты и нажмите снова.'));
+          }
+
+          const code = codeMatch[0].replace(/\D/g, '');
+
+          if (code.length !== 6) {
+            return rej(new Error('🔍 Код не найден в письме. Подождите 1-2 минуты и нажмите снова.'));
+          }
+
+          console.log('[Gmail] Итоговый код:', code);
+          res(code);
+        });
+      });
+    }
+
+    // Читаем последнее письмо из результатов поиска
+    function fetchLatest(results, callback) {
+      const latest = [results[results.length - 1]];
+      console.log('[Gmail] Читаем письмо UID:', latest[0]);
+
+      const fetch = imap.fetch(latest, { bodies: '' });
+      let fetched = false;
+
+      fetch.on('message', (msg) => {
+        fetched = true;
+        msg.on('body', async (stream) => {
+          try {
+            const code = await parseAndExtractCode(stream);
+            // Помечаем прочитанным
+            try { imap.addFlags(latest, '\\Seen', () => {}); } catch(e) {}
+            callback(null, code);
+          } catch (err) {
+            callback(err);
+          }
+        });
+      });
+
+      fetch.once('error', (err) => callback(err));
+
+      fetch.once('end', () => {
+        if (!fetched) callback(new Error('❓ Не удалось прочитать письмо. Попробуйте ещё раз.'));
+      });
+    }
+
+    // Ищем в папке
+    function searchInBox(boxName, callback) {
+      imap.openBox(boxName, false, (err) => {
         if (err) {
-          console.error('[Gmail] Ошибка открытия INBOX:', err.message);
-          imap.end();
-          return reject(err);
+          console.log(`[Gmail] Не удалось открыть папку ${boxName}:`, err.message);
+          return callback(null, []);
         }
 
-        const since = new Date(Date.now() - 30 * 60 * 1000);
-        console.log('[Gmail] Ищем письма с:', since.toISOString());
+        // Ищем за последние 2 часа — БЕЗ UNSEEN
+        const since = new Date(Date.now() - 2 * 60 * 60 * 1000);
 
-        // UNSEEN убран — ищем все письма за 30 минут
-       imap.search(
-  [['FROM', 'no-reply@supercell.com'], ['UNSEEN']],
-
+        imap.search(
+          [['FROM', 'no-reply@supercell.com'], ['SINCE', since]],
           (err, results) => {
             if (err) {
-              console.error('[Gmail] Ошибка поиска:', err.message);
-              imap.end();
-              return reject(err);
+              console.log(`[Gmail] Ошибка поиска в ${boxName}:`, err.message);
+              return callback(null, []);
             }
-
-            console.log('[Gmail] Найдено писем:', results ? results.length : 0);
-
-            if (!results || results.length === 0) {
-              imap.end();
-              return reject(new Error('📭 Письмо от Supercell не найдено. Попросите покупателя снова нажать "Отправить код" в игре.'));
-            }
-
-            const latest = [results[results.length - 1]];
-            console.log('[Gmail] Читаем письмо UID:', latest[0]);
-            const fetch = imap.fetch(latest, { bodies: '' });
-
-            fetch.on('message', (msg) => {
-              msg.on('body', (stream) => {
-                simpleParser(stream, (err, parsed) => {
-                  if (err) {
-                    console.error('[Gmail] Ошибка парсинга:', err.message);
-                    imap.end();
-                    if (!resolved) { resolved = true; reject(err); }
-                    return;
-                  }
-
-                  const subject = parsed.subject || '';
-                  const text = parsed.text || '';
-                  const html = parsed.html || '';
-                  const fullText = text + ' ' + html;
-
-                  console.log('[Gmail] Subject:', subject);
-                  console.log('[Gmail] Text preview:', text.slice(0, 300));
-
-                  const isDangerous =
-                    subject.includes('смену адреса') ||
-                    subject.includes('смену электронной') ||
-                    fullText.includes('смену адреса электронной почты') ||
-                    fullText.includes('Никогда никому не сообщайте') ||
-                    fullText.includes('запрос на смену') ||
-                    fullText.includes('изменить адрес электронной почты');
-
-                  if (isDangerous) {
-                    console.warn('[Gmail] Опасное письмо — пропускаем');
-                    imap.end();
-                    if (!resolved) {
-                      resolved = true;
-                      reject(new Error('⛔ Это письмо о смене почты — код не выдаётся в целях безопасности.'));
-                    }
-                    return;
-                  }
-
-                  const isLoginEmail =
-                    subject.includes('хочет загрузить') ||
-                    subject.includes('игровые достижения') ||
-                    subject.includes('verification') ||
-                    subject.includes('верификац') ||
-                    fullText.includes('хочет загрузить свои игровые достижения') ||
-                    (fullText.includes('Выполняется вход') && fullText.includes('Brawl Stars')) ||
-                    fullText.includes('Сообщите этот код верификации') ||
-                    fullText.includes('код верификации') ||
-                    fullText.includes('verification code') ||
-                    fullText.includes('Brawl Stars');
-
-                  console.log('[Gmail] isLoginEmail:', isLoginEmail);
-
-                  if (!isLoginEmail) {
-                    imap.end();
-                    if (!resolved) {
-                      resolved = true;
-                      reject(new Error('📧 Письмо не является кодом входа Brawl Stars. Попросите покупателя снова нажать "Отправить код".'));
-                    }
-                    return;
-                  }
-
-                  // Ищем 6-значный код разными способами
-                  const codeMatch =
-                    fullText.match(/\b(\d{6})\b/) ||
-                    fullText.match(/(\d)\s(\d)\s(\d)\s(\d)\s(\d)\s(\d)/) ||
-                    fullText.match(/(\d{3})[- ](\d{3})/);
-
-                  console.log('[Gmail] codeMatch:', codeMatch ? codeMatch[0] : 'не найден');
-
-                  if (!codeMatch) {
-                    imap.end();
-                    if (!resolved) {
-                      resolved = true;
-                      reject(new Error('🔍 Код не найден в письме. Попробуйте ещё раз через минуту.'));
-                    }
-                    return;
-                  }
-
-                  const code = codeMatch[0].replace(/\D/g, '');
-                  console.log('[Gmail] Итоговый код:', code);
-
-                  imap.addFlags(latest, '\\Seen', () => {});
-                  imap.end();
-
-                  if (!resolved) {
-                    resolved = true;
-                    resolve(code);
-                  }
-                });
-              });
-            });
-
-            fetch.once('error', (err) => {
-              console.error('[Gmail] Fetch error:', err.message);
-              imap.end();
-              if (!resolved) { resolved = true; reject(err); }
-            });
-
-            fetch.once('end', () => {
-              if (!resolved) {
-                imap.end();
-                resolved = true;
-                reject(new Error('❓ Не удалось прочитать письмо. Попробуйте ещё раз.'));
-              }
-            });
+            console.log(`[Gmail] Папка ${boxName}: найдено ${results ? results.length : 0} писем`);
+            callback(null, results || []);
           }
         );
+      });
+    }
+
+    imap.once('ready', () => {
+      console.log('[Gmail] Подключились к IMAP');
+
+      // Сначала ищем в INBOX
+      searchInBox('INBOX', (err, inboxResults) => {
+        if (inboxResults && inboxResults.length > 0) {
+          fetchLatest(inboxResults, (err, code) => {
+            if (err) return done(err);
+            done(null, code);
+          });
+          return;
+        }
+
+        // Если в INBOX нет — ищем в All Mail
+        console.log('[Gmail] В INBOX не найдено, проверяем All Mail...');
+        searchInBox('[Gmail]/All Mail', (err2, allMailResults) => {
+          if (!allMailResults || allMailResults.length === 0) {
+            return done(new Error(
+              '📭 Письмо от Supercell не найдено.\n\n' +
+              'Убедитесь что:\n' +
+              '1. Нажали "Отправить код" в игре\n' +
+              '2. Ввели правильную почту магазина\n' +
+              '3. Подождите 1-2 минуты и попробуйте снова'
+            ));
+          }
+
+          fetchLatest(allMailResults, (err2, code) => {
+            if (err2) return done(err2);
+            done(null, code);
+          });
+        });
       });
     });
 
     imap.once('error', (err) => {
       console.error('[Gmail] IMAP connection error:', err.message);
-      if (!resolved) { resolved = true; reject(err); }
+      done(new Error('❌ Ошибка подключения к Gmail: ' + err.message));
     });
+
+    imap.once('end', () => {
+      if (!resolved) {
+        done(new Error('❓ Соединение с Gmail закрыто. Попробуйте ещё раз.'));
+      }
+    });
+
+    // Таймаут 30 секунд
+    const timeout = setTimeout(() => {
+      done(new Error('⏱ Превышено время ожидания Gmail. Попробуйте ещё раз.'));
+    }, 30000);
+
+    imap.once('ready', () => clearTimeout(timeout));
 
     imap.connect();
   });
@@ -466,12 +517,12 @@ bot.use(session());
 const pendingEmailByChatId = new Map();
 const pendingMainMsgStore = new Map();
 const pendingLastOrderStore = new Map();
-const verifiedAdmins = new Set();
 
 const lockMsgStore = new Map();
 
+// isAdmin теперь проверяет БД — не слетает при рестарте
 function isAdmin(ctx) {
-  return String(ctx.chat?.id) === String(ADMIN_CHAT_ID) && verifiedAdmins.has(String(ctx.chat?.id));
+  return String(ctx.chat?.id) === String(ADMIN_CHAT_ID) && adminSessionsDb.isVerified(ctx.chat?.id);
 }
 
 function isAdminChat(ctx) {
@@ -567,7 +618,7 @@ setInterval(async () => {
 // =====================
 // ЭКРАНЫ КАТАЛОГА
 // =====================
-function buildCatalogScreen(index, discount = 0, mode = 'buy') {
+function buildCatalogScreen(index, discount = 0) {
   const accounts = accountsDb.getAll();
 
   if (accounts.length === 0) {
@@ -581,7 +632,7 @@ function buildCatalogScreen(index, discount = 0, mode = 'buy') {
 
   const i = Math.max(0, Math.min(index, accounts.length - 1));
   const account = accounts[i];
-  const finalPrice = mode === 'buy' ? Math.max(0, account.price - discount) : 0;
+  const finalPrice = Math.max(0, account.price - discount);
 
   let caption =
     `🏆 *${escapeMarkdown(account.title)}*\n\n` +
@@ -590,7 +641,7 @@ function buildCatalogScreen(index, discount = 0, mode = 'buy') {
     `📅 Год: *${account.year}*\n\n`;
 
   caption += `💰 *Купить:* ${escapeMarkdown(formatPrice(account.price))}`;
-  if (discount > 0 && mode === 'buy') {
+  if (discount > 0) {
     caption += ` → *${escapeMarkdown(formatPrice(finalPrice))}* 🎁`;
   }
   caption += '\n';
@@ -636,26 +687,17 @@ function buildCatalogScreen(index, discount = 0, mode = 'buy') {
 }
 
 // =====================
-// ЭКРАНЫ АРЕНДЫ
+// ЭКРАНЫ
 // =====================
-function screenRentOptions(account, discount) {
+function screenRentOptions(account) {
   const rows = [];
-
   if (account.rent_price_day > 0) {
-    rows.push([{
-      text: `📅 1 день — ${formatPrice(account.rent_price_day)}`,
-      callback_data: `rentpay_${account.id}_1`,
-    }]);
+    rows.push([{ text: `📅 1 день — ${formatPrice(account.rent_price_day)}`, callback_data: `rentpay_${account.id}_1` }]);
   }
   if (account.rent_price_week > 0) {
-    rows.push([{
-      text: `📆 7 дней — ${formatPrice(account.rent_price_week)}`,
-      callback_data: `rentpay_${account.id}_7`,
-    }]);
+    rows.push([{ text: `📆 7 дней — ${formatPrice(account.rent_price_week)}`, callback_data: `rentpay_${account.id}_7` }]);
   }
-
   rows.push([{ text: '◀ Назад в каталог', callback_data: 'back_catalog' }]);
-
   return {
     type: 'text',
     text:
@@ -711,9 +753,6 @@ function screenRentEnterShopEmail(accountTitle, orderId) {
   };
 }
 
-// =====================
-// ЭКРАНЫ ПОКУПАТЕЛЯ
-// =====================
 function screenPayment(account, finalPrice, type = 'buy', days = 0) {
   const label = type === 'rent' ? (days === 1 ? '1 день' : `${days} дней`) : null;
   return {
@@ -792,44 +831,6 @@ function screenCodeWaiting() {
       `Продавец проверяет код и завершает передачу аккаунта\\.\n` +
       `Пожалуйста, подождите\\.\\.\\.`,
     keyboard: { inline_keyboard: [] },
-  };
-}
-
-function screenSuccess(accountTitle, type = 'buy', rentUntil = null) {
-  let text =
-    `🎉 *Поздравляем\\! ${type === 'rent' ? 'Аренда активирована\\!' : 'Заказ завершён\\!'}*\n\n` +
-    `🏆 Аккаунт *${escapeMarkdown(accountTitle)}* ${type === 'rent' ? 'в вашем распоряжении' : 'передан вам'}\\.\n\n`;
-
-  if (type === 'rent' && rentUntil) {
-    text += `⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*\n\n`;
-  }
-
-  text += `Спасибо за покупку\\! По вопросам: @brawlhelpp`;
-
-  return {
-    type: 'text',
-    text,
-    keyboard: {
-      inline_keyboard: [
-        [{ text: '⭐ Оставить отзыв', callback_data: 'leave_review' }],
-        [{ text: '🏠 Вернуться в каталог', callback_data: 'back_catalog' }],
-      ],
-    },
-  };
-}
-
-function screenRejected(orderId) {
-  return {
-    type: 'text',
-    text:
-      `❌ *Заказ \\#${escapeMarkdown(orderId)} отклонён*\n\n` +
-      `Оплата не найдена или имя не совпало\\.\n` +
-      `Если уже перевели деньги — напишите: @brawlhelpp`,
-    keyboard: {
-      inline_keyboard: [
-        [{ text: '◀ Вернуться в каталог', callback_data: 'back_catalog' }],
-      ],
-    },
   };
 }
 
@@ -930,10 +931,10 @@ bot.start(async (ctx) => {
     : '';
 
   if (chatId === String(ADMIN_CHAT_ID)) {
-    const isVerified = verifiedAdmins.has(chatId);
+    const isVerified = adminSessionsDb.isVerified(chatId);
     await ctx.reply(
       `👋 Привет, Администратор\\!${discountLine}\n\n` +
-      (isVerified ? `✅ Вы авторизованы\\.` : `🔐 Войдите: /login пароль`),
+      (isVerified ? `✅ Вы авторизованы\\.` : `🔐 Войдите командой:\n/login ваш_пароль`),
       {
         parse_mode: 'MarkdownV2',
         reply_markup: {
@@ -972,7 +973,6 @@ bot.start(async (ctx) => {
 bot.command('catalog', async (ctx) => {
   ctx.session = ctx.session || {};
   ctx.session.step = 'catalog';
-  ctx.session.catalogIndex = 0;
   const discount = getUserDiscount(ctx.chat.id);
   const screen = buildCatalogScreen(0, discount);
   ctx.session.catalogIndex = screen.accountIndex ?? 0;
@@ -1006,7 +1006,6 @@ bot.command('myorders', async (ctx) => {
     if (o.discount > 0) text += ` \\(−${escapeMarkdown(formatPrice(o.discount))}\\)`;
     text += ` • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n\n`;
   }
-
   await ctx.reply(text, { parse_mode: 'MarkdownV2' });
 });
 
@@ -1025,20 +1024,17 @@ bot.command('help', async (ctx) => {
     `8️⃣ Введите email → получите код\n` +
     `9️⃣ Введите код из письма\n` +
     `🔟 Готово\\! 🏆\n\n` +
-    `*Аренда:*\n` +
-    `🔑 Аккаунт доступен на выбранный срок \\(1 или 7 дней\\)\\.\n` +
-    `По истечении срока доступ закрывается автоматически\\.\n\n` +
     `📞 По вопросам: @brawlhelpp`;
 
   if (isAdm) {
     text +=
       `\n\n*Команды администратора:*\n` +
-      `/login — войти в панель\n` +
+      `/login пароль — войти в панель\n` +
+      `/logout — выйти\n` +
       `/orders — все заказы\n` +
       `/stats — статистика\n` +
       `/reviews — отзывы\n` +
-      `/accounts — все аккаунты\n` +
-      `/myorders — мои заказы как покупателя`;
+      `/accounts — все аккаунты`;
   }
 
   await ctx.reply(text, { parse_mode: 'MarkdownV2' });
@@ -1046,23 +1042,40 @@ bot.command('help', async (ctx) => {
 
 // =====================
 // КОМАНДЫ АДМИНА
+// ИСПРАВЛЕНО: пароль НЕ удаляется, сессия хранится в БД
 // =====================
 bot.command('login', async (ctx) => {
   if (!isAdminChat(ctx)) return;
-  const password = ctx.message.text.split(' ')[1];
-  try { await ctx.deleteMessage(); } catch (e) {}
+
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const password = parts[1];
+
+  // НЕ удаляем сообщение — чтобы видеть что вводили
+  // Но можно раскомментировать если хочешь скрывать пароль:
+  // try { await ctx.deleteMessage(); } catch (e) {}
+
+  if (!password) {
+    await ctx.reply(
+      '🔐 Введите пароль так:\n\n/login ваш_пароль',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
   if (password === ADMIN_PASSWORD) {
-    verifiedAdmins.add(String(ctx.chat.id));
+    adminSessionsDb.add(String(ctx.chat.id));
     await deleteLockMsg(ctx.chat.id);
-    await ctx.reply('✅ Вы вошли как администратор. Все кнопки активны.');
+    await ctx.reply(
+      '✅ Вы вошли как администратор!\n\nВсе кнопки теперь активны. Сессия сохранена — не слетит при перезапуске бота.',
+    );
   } else {
-    await ctx.reply('❌ Неверный пароль.');
+    await ctx.reply('❌ Неверный пароль. Попробуйте ещё раз: /login ваш_пароль');
   }
 });
 
 bot.command('logout', async (ctx) => {
   if (!isAdminChat(ctx)) return;
-  verifiedAdmins.delete(String(ctx.chat.id));
+  adminSessionsDb.remove(String(ctx.chat.id));
   await ctx.reply('👋 Вы вышли из панели администратора.');
 });
 
@@ -1155,7 +1168,6 @@ async function showReviews(ctx) {
     if (r.text) text += `_${escapeMarkdown(r.text)}_\n`;
     text += `🕐 ${escapeMarkdown(formatDate(r.created_at))}\n\n`;
   }
-
   await ctx.reply(text, { parse_mode: 'MarkdownV2' });
 }
 
@@ -1188,7 +1200,6 @@ async function showAccounts(ctx) {
 bot.hears('📋 Каталог аккаунтов', async (ctx) => {
   ctx.session = ctx.session || {};
   ctx.session.step = 'catalog';
-  ctx.session.catalogIndex = 0;
   const discount = getUserDiscount(ctx.chat.id);
   const screen = buildCatalogScreen(0, discount);
   ctx.session.catalogIndex = screen.accountIndex ?? 0;
@@ -1321,13 +1332,11 @@ bot.action(/^rent_(.+)$/, async (ctx) => {
     await ctx.answerCbQuery('❌ Аккаунт недоступен');
     return;
   }
-
   if (account.rented) {
     await ctx.answerCbQuery('⏳ Аккаунт сейчас в аренде');
     await tempMsg(ctx.chat.id, '⏳ Этот аккаунт сейчас в аренде. Попробуйте позже или выберите другой.');
     return;
   }
-
   if (ordersDb.hasPendingOrder(String(ctx.chat.id))) {
     await ctx.answerCbQuery('⚠️ У вас уже есть активный заказ!');
     await tempMsg(ctx.chat.id, '⚠️ У вас уже есть активный заказ.');
@@ -1339,7 +1348,7 @@ bot.action(/^rent_(.+)$/, async (ctx) => {
   ctx.session.step = 'rent_options';
 
   await ctx.answerCbQuery();
-  await goTo(ctx.chat.id, ctx.session, screenRentOptions(account, getUserDiscount(ctx.chat.id)));
+  await goTo(ctx.chat.id, ctx.session, screenRentOptions(account));
 });
 
 bot.action(/^rentpay_(.+)_(\d+)$/, async (ctx) => {
@@ -1375,7 +1384,6 @@ bot.action(/^rentpaid_(.+)_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery('❌ Аккаунт недоступен');
     return;
   }
-
   if (spamDb.check(String(chatId), 'paid', 2, 30)) {
     await ctx.answerCbQuery('⛔ Слишком много попыток');
     return;
@@ -1419,7 +1427,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
   spamDb.log(String(ctx.chat.id), 'getrentcode');
 
   await ctx.answerCbQuery('📨 Читаю письмо...');
-
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
 
   const loadingMsg = await bot.telegram.sendMessage(
@@ -1430,24 +1437,16 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
 
   try {
     const code = await getSupercellCode();
-
     try { await bot.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
 
     const rentUntil = rentUntilDate(order.rent_days || 1);
-
-    ordersDb.update(orderId, {
-      status: 'fulfilled',
-      code: code,
-      rent_until: rentUntil,
-    });
-
+    ordersDb.update(orderId, { status: 'fulfilled', code, rent_until: rentUntil });
     usersDb.incrementOrders(String(order.buyer_chat_id));
 
     if (order.referred_by) {
       usersDb.addDiscount(order.referred_by, 100);
       try {
-        await bot.telegram.sendMessage(
-          Number(order.referred_by),
+        await bot.telegram.sendMessage(Number(order.referred_by),
           `🎁 По вашей реферальной ссылке совершили покупку\\!\n\nВы получили скидку *100 ₽* на следующую покупку\\.`,
           { parse_mode: 'MarkdownV2' }
         );
@@ -1487,7 +1486,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
 
   } catch (err) {
     console.error('[Gmail RENT ERROR]', err.message);
-
     try { await bot.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
 
     const sent = await bot.telegram.sendMessage(
@@ -1518,7 +1516,7 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
 });
 
 // =====================
-// КНОПКИ ОТЗЫВОВ
+// ОТЗЫВЫ
 // =====================
 bot.action('leave_review', async (ctx) => {
   ctx.session = ctx.session || {};
@@ -1559,7 +1557,7 @@ bot.action('close_lock_msg', async (ctx) => {
 });
 
 // =====================
-// КНОПКИ РЕФЕРАЛА
+// РЕФЕРАЛ
 // =====================
 bot.hears('🔗 Моя реферальная ссылка', async (ctx) => {
   const user = usersDb.get(String(ctx.chat.id));
@@ -1632,7 +1630,6 @@ bot.hears('📦 Мои заказы', async (ctx) => {
     text += `🎮 ${escapeMarkdown(o.account_title || '—')}\n`;
     text += `💰 ${escapeMarkdown(formatPrice(o.price))} • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n\n`;
   }
-
   await ctx.reply(text, { parse_mode: 'MarkdownV2' });
 });
 
@@ -1650,9 +1647,6 @@ bot.hears('❓ Помощь', async (ctx) => {
     `7️⃣ Введите email → получите код\n` +
     `8️⃣ Введите код из письма\n` +
     `9️⃣ Готово\\! 🏆\n\n` +
-    `*Аренда:*\n` +
-    `🔑 Аккаунт доступен на 1 или 7 дней\n` +
-    `По истечении срока доступ закрывается автоматически\n\n` +
     `📞 По вопросам: @brawlhelpp`;
 
   if (isAdm) {
@@ -1674,7 +1668,7 @@ bot.hears('➕ Добавить аккаунт', async (ctx) => {
   ctx.session = ctx.session || {};
   ctx.session.step = 'admin_add_title';
   await ctx.reply(
-    `➕ *Добавление аккаунта*\n\nШаг 1/5 — Введите название:\n_Например: Brawl Stars — 35 000 кубков_`,
+    `➕ *Добавление аккаунта*\n\nШаг 1/4 — Введите название:\n_Например: Brawl Stars — 35 000 кубков_`,
     {
       parse_mode: 'MarkdownV2',
       reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
@@ -1696,7 +1690,7 @@ bot.action(/^del_acc_(.+)$/, async (ctx) => {
   const account = accountsDb.getById(id);
   if (!account) return ctx.answerCbQuery('❌ Не найден');
   accountsDb.delete(id);
-  await ctx.answerCbQuery(`✅ Удалён`);
+  await ctx.answerCbQuery('✅ Удалён');
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
   await ctx.reply(`✅ Аккаунт *${escapeMarkdown(account.title)}* удалён\\.`, { parse_mode: 'MarkdownV2' });
 });
@@ -1742,7 +1736,7 @@ bot.action(/^admin_order_(.+)$/, async (ctx) => {
 });
 
 // =====================
-// MIDDLEWARE
+// MIDDLEWARE (восстановление pending состояний)
 // =====================
 bot.use(async (ctx, next) => {
   if (ctx.message?.text) {
@@ -1773,6 +1767,7 @@ bot.use(async (ctx, next) => {
 
 // =====================
 // ОБРАБОТКА ТЕКСТА
+// ИСПРАВЛЕНО: /login НЕ попадает сюда (команды обрабатываются раньше)
 // =====================
 bot.on('text', async (ctx) => {
   ctx.session = ctx.session || {};
@@ -1780,8 +1775,7 @@ bot.on('text', async (ctx) => {
   const step = ctx.session.step;
   const chatId = ctx.chat.id;
 
-  try { await ctx.deleteMessage(); } catch (e) {}
-
+  // Команды и кнопки меню — не трогаем
   if (text.startsWith('/')) return;
   if ([
     '📋 Каталог аккаунтов', '🔗 Моя реферальная ссылка', '📦 Мои заказы',
@@ -1789,11 +1783,15 @@ bot.on('text', async (ctx) => {
     '➕ Добавить аккаунт', '❓ Помощь',
   ].includes(text)) return;
 
+  // Удаляем только пользовательский ввод (не команды)
+  try { await ctx.deleteMessage(); } catch (e) {}
+
+  // Шаги добавления аккаунта (только для админа)
   if (isAdminChat(ctx) && step === 'admin_add_title') {
     ctx.session.newAccount = { title: text };
     ctx.session.step = 'admin_add_stats';
     await ctx.reply(
-      `✅ Название: *${escapeMarkdown(text)}*\n\nШаг 2/5 — Введите характеристики:\n_кубки бойцы цена год_\n_Например: 35000 70 1200 2024_`,
+      `✅ Название: *${escapeMarkdown(text)}*\n\nШаг 2/4 — Введите характеристики:\n_кубки бойцы цена год_\n_Например: 35000 70 1200 2024_`,
       {
         parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
@@ -1812,7 +1810,7 @@ bot.on('text', async (ctx) => {
     ctx.session.newAccount = { ...ctx.session.newAccount, trophies, fighters, price, year };
     ctx.session.step = 'admin_add_rent';
     await ctx.reply(
-      `✅ Характеристики сохранены\\!\n\nШаг 3/5 — Введите цены аренды:\n_цена_за_1_день цена_за_7_дней_\n_Например: 100 500_\n\n_Напишите 0 0 если аренда не нужна_`,
+      `✅ Характеристики сохранены\\!\n\nШаг 3/4 — Введите цены аренды:\n_цена_за_1_день цена_за_7_дней_\n_Например: 100 500_\n\n_Напишите 0 0 если аренда не нужна_`,
       {
         parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
@@ -1831,7 +1829,7 @@ bot.on('text', async (ctx) => {
     ctx.session.newAccount = { ...ctx.session.newAccount, rent_price_day: rentDay, rent_price_week: rentWeek };
     ctx.session.step = 'admin_add_image';
     await ctx.reply(
-      `✅ Цены аренды сохранены\\!\n\nШаг 4/5 — Отправьте ссылку на фото:\n_Например: https://i\\.ibb\\.co/xxx/photo\\.jpg_`,
+      `✅ Цены аренды сохранены\\!\n\nШаг 4/4 — Отправьте ссылку на фото:\n_Например: https://i\\.ibb\\.co/xxx/photo\\.jpg_`,
       {
         parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
@@ -1914,9 +1912,7 @@ bot.on('text', async (ctx) => {
 
     await goTo(chatId, ctx.session, screenWaiting(orderId, text, orderType));
 
-    const typeLabel = orderType === 'rent'
-      ? `🔑 Аренда ${rentDays} дн\\.`
-      : '🛒 Покупка';
+    const typeLabel = orderType === 'rent' ? `🔑 Аренда ${rentDays} дн\\.` : '🛒 Покупка';
 
     await notifyAdmin(
       `🆕 *Новый заказ \\#${escapeMarkdown(orderId)}*\n\n` +
@@ -2036,33 +2032,24 @@ async function handleFulfill(ctx, orderId) {
 
   if (order.type === 'rent') {
     accountsDb.setRented(order.account_id, true);
-
     await ctx.reply(
-      `✅ Заказ *\\#${escapeMarkdown(orderId)}* подтверждён\\. Отправляю почту покупателю\\.`,
+      `✅ Заказ *\\#${escapeMarkdown(orderId)}* подтверждён\\. Отправляю инструкцию покупателю\\.`,
       { parse_mode: 'MarkdownV2' }
     );
-
     try {
       const screen = screenRentEnterShopEmail(order.account_title, orderId);
-      const sent = await bot.telegram.sendMessage(
-        Number(order.buyer_chat_id),
-        screen.text,
-        {
-          parse_mode: 'MarkdownV2',
-          reply_markup: screen.keyboard,
-        }
-      );
+      const sent = await bot.telegram.sendMessage(Number(order.buyer_chat_id), screen.text, {
+        parse_mode: 'MarkdownV2',
+        reply_markup: screen.keyboard,
+      });
       pendingMainMsgStore.set(String(order.buyer_chat_id), sent.message_id);
     } catch (e) { console.warn(e.message); }
-
   } else {
     pendingEmailByChatId.set(String(order.buyer_chat_id), orderId);
-
     await ctx.reply(
       `✅ Заказ *\\#${escapeMarkdown(orderId)}* подтверждён\\. Ожидаю email от покупателя\\.`,
       { parse_mode: 'MarkdownV2' }
     );
-
     try {
       const sent = await bot.telegram.sendMessage(
         Number(order.buyer_chat_id),
@@ -2080,10 +2067,7 @@ async function handleReject(ctx, orderId) {
   if (order.status === 'fulfilled') { await ctx.reply('⚠️ Заказ уже завершён.'); return; }
 
   ordersDb.update(orderId, { status: 'rejected' });
-
-  if (order.type === 'rent') {
-    accountsDb.setRented(order.account_id, false);
-  }
+  if (order.type === 'rent') accountsDb.setRented(order.account_id, false);
 
   await ctx.reply(`❌ Заказ *\\#${escapeMarkdown(orderId)}* отклонён\\.`, { parse_mode: 'MarkdownV2' });
 
@@ -2103,7 +2087,7 @@ async function handleComplete(ctx, orderId) {
   const order = ordersDb.get(orderId);
   if (!order) { await ctx.reply(`❌ Заказ #${orderId} не найден.`); return; }
   if (order.status !== 'code_received' && order.status !== 'confirmed') {
-    await ctx.reply(`⚠️ Заказ не готов к завершению (${statusLabel(order.status)}).`);
+    await ctx.reply(`⚠️ Заказ не готов к завершению \\(${escapeMarkdown(statusLabel(order.status))}\\)\\.`, { parse_mode: 'MarkdownV2' });
     return;
   }
 
@@ -2127,32 +2111,23 @@ async function handleComplete(ctx, orderId) {
 
   const rentUntil = order.type === 'rent' ? rentUntilDate(order.rent_days || 1) : null;
 
-  ordersDb.update(orderId, {
-    status: 'fulfilled',
-    code: finalCode,
-    rent_until: rentUntil,
-  });
+  ordersDb.update(orderId, { status: 'fulfilled', code: finalCode, rent_until: rentUntil });
 
-  if (order.type === 'buy') {
-    accountsDb.markSold(order.account_id);
-  }
+  if (order.type === 'buy') accountsDb.markSold(order.account_id);
 
   usersDb.incrementOrders(String(order.buyer_chat_id));
 
   if (order.referred_by) {
     usersDb.addDiscount(order.referred_by, 100);
     try {
-      await bot.telegram.sendMessage(
-        Number(order.referred_by),
+      await bot.telegram.sendMessage(Number(order.referred_by),
         `🎁 По вашей реферальной ссылке совершили покупку\\!\n\nВы получили скидку *100 ₽* на следующую покупку\\.`,
         { parse_mode: 'MarkdownV2' }
       );
     } catch (e) {}
   }
 
-  const rentInfo = rentUntil
-    ? `\n⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*`
-    : '';
+  const rentInfo = rentUntil ? `\n⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*` : '';
 
   await ctx.reply(
     `🏆 Заказ *\\#${escapeMarkdown(orderId)}* завершён\\!\n\n` +
