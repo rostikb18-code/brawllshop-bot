@@ -1,15 +1,16 @@
 {
-  "name": "brawl-shop-bot",
-  "version": "2.0.0",
+  "name": "ksbkr-server",
+  "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "npm rebuild better-sqlite3"
+    "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.3",
-    "better-sqlite3": "^9.4.3",
-    "express": "^4.18.2",
-    "dotenv": "^16.4.5"
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.6.0",
+    "uuid": "^9.0.0"
   }
 }
