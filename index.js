@@ -275,8 +275,9 @@ function getSupercellCode() {
         console.log('[Gmail] Ищем письма с:', since.toISOString());
 
         // UNSEEN убран — ищем все письма за 30 минут
-        imap.search(
-          [['FROM', 'no-reply@supercell.com'], ['SINCE', since]],
+       imap.search(
+  [['FROM', 'no-reply@supercell.com'], ['UNSEEN']],
+
           (err, results) => {
             if (err) {
               console.error('[Gmail] Ошибка поиска:', err.message);
