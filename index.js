@@ -1,11 +1,12 @@
 require('dotenv').config();
-const { Telegraf, session, Markup } = require('telegraf');
+const { Telegraf, session } = require('telegraf');
 const express = require('express');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
 // =====================
 // БАЗА ДАННЫХ
@@ -19,9 +20,12 @@ db.exec(`
     trophies INTEGER NOT NULL,
     fighters INTEGER NOT NULL,
     price INTEGER NOT NULL,
+    rent_price_day INTEGER DEFAULT 0,
+    rent_price_week INTEGER DEFAULT 0,
     year INTEGER NOT NULL,
     image_url TEXT NOT NULL,
     sold INTEGER DEFAULT 0,
+    rented INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -33,6 +37,9 @@ db.exec(`
     account_id TEXT,
     account_title TEXT,
     price INTEGER,
+    type TEXT DEFAULT 'buy',
+    rent_days INTEGER DEFAULT 0,
+    rent_until TEXT,
     status TEXT DEFAULT 'pending',
     code TEXT,
     referred_by TEXT,
@@ -68,18 +75,22 @@ db.exec(`
   );
 `);
 
-// Добавить стартовый аккаунт если таблица пустая
+// Миграция: добавить колонки аренды если их нет
+try { db.exec(`ALTER TABLE accounts ADD COLUMN rent_price_day INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE accounts ADD COLUMN rent_price_week INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE accounts ADD COLUMN rented INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE orders ADD COLUMN type TEXT DEFAULT 'buy'`); } catch(e) {}
+try { db.exec(`ALTER TABLE orders ADD COLUMN rent_days INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE orders ADD COLUMN rent_until TEXT`); } catch(e) {}
+
+// Стартовый аккаунт
 const existingAccounts = db.prepare('SELECT COUNT(*) as count FROM accounts').get();
 if (existingAccounts.count === 0) {
   db.prepare(`
-    INSERT INTO accounts (id, title, trophies, fighters, price, year, image_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    'acc-29444',
-    'Brawl Stars — 29 444 кубка',
-    29444, 65, 800, 2024,
-    'https://i.ibb.co/qYT3zH2F/photo-2026-06-20-23-05-47.jpg'
-  );
+    INSERT INTO accounts (id, title, trophies, fighters, price, rent_price_day, rent_price_week, year, image_url)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run('acc-29444', 'Brawl Stars — 29 444 кубка', 29444, 65, 800, 100, 500, 2024,
+    'https://i.ibb.co/qYT3zH2F/photo-2026-06-20-23-05-47.jpg');
 }
 
 // =====================
@@ -97,12 +108,15 @@ const accountsDb = {
   },
   add(account) {
     db.prepare(`
-      INSERT INTO accounts (id, title, trophies, fighters, price, year, image_url)
-      VALUES (@id, @title, @trophies, @fighters, @price, @year, @image_url)
+      INSERT INTO accounts (id, title, trophies, fighters, price, rent_price_day, rent_price_week, year, image_url)
+      VALUES (@id, @title, @trophies, @fighters, @price, @rent_price_day, @rent_price_week, @year, @image_url)
     `).run(account);
   },
   markSold(id) {
-    db.prepare("UPDATE accounts SET sold = 1 WHERE id = ?").run(id);
+    db.prepare('UPDATE accounts SET sold = 1, rented = 0 WHERE id = ?').run(id);
+  },
+  setRented(id, rented) {
+    db.prepare('UPDATE accounts SET rented = ? WHERE id = ?').run(rented ? 1 : 0, id);
   },
   delete(id) {
     db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
@@ -112,8 +126,8 @@ const accountsDb = {
 const ordersDb = {
   create(order) {
     db.prepare(`
-      INSERT INTO orders (order_id, buyer_chat_id, buyer_name, account_id, account_title, price, referred_by, discount)
-      VALUES (@order_id, @buyer_chat_id, @buyer_name, @account_id, @account_title, @price, @referred_by, @discount)
+      INSERT INTO orders (order_id, buyer_chat_id, buyer_name, account_id, account_title, price, type, rent_days, rent_until, referred_by, discount)
+      VALUES (@order_id, @buyer_chat_id, @buyer_name, @account_id, @account_title, @price, @type, @rent_days, @rent_until, @referred_by, @discount)
     `).run(order);
   },
   get(orderId) {
@@ -143,6 +157,11 @@ const ordersDb = {
       "SELECT 1 FROM orders WHERE buyer_chat_id = ? AND status IN ('pending','confirmed','code_received') LIMIT 1"
     ).get(chatId);
   },
+  getExpiredRentals() {
+    return db.prepare(
+      "SELECT * FROM orders WHERE type = 'rent' AND status = 'fulfilled' AND rent_until < datetime('now')"
+    ).all();
+  },
   getStats() {
     const today = db.prepare(`
       SELECT COUNT(*) as count, COALESCE(SUM(price - discount), 0) as revenue
@@ -159,7 +178,10 @@ const ordersDb = {
     const pending = db.prepare(
       "SELECT COUNT(*) as count FROM orders WHERE status = 'pending'"
     ).get();
-    return { today, week, total, pending };
+    const rentActive = db.prepare(
+      "SELECT COUNT(*) as count FROM orders WHERE type = 'rent' AND status = 'fulfilled' AND rent_until > datetime('now')"
+    ).get();
+    return { today, week, total, pending, rentActive };
   },
 };
 
@@ -174,15 +196,11 @@ const usersDb = {
     const existing = this.get(chatId);
     if (existing) return existing;
     const refCode = 'REF' + Math.random().toString(36).slice(2, 8).toUpperCase();
-    db.prepare(`
-      INSERT OR IGNORE INTO users (chat_id, username, ref_code)
-      VALUES (?, ?, ?)
-    `).run(chatId, username || null, refCode);
+    db.prepare('INSERT OR IGNORE INTO users (chat_id, username, ref_code) VALUES (?, ?, ?)').run(chatId, username || null, refCode);
     return this.get(chatId);
   },
   setReferredBy(chatId, referrerChatId) {
-    db.prepare('UPDATE users SET referred_by = ? WHERE chat_id = ? AND referred_by IS NULL')
-      .run(referrerChatId, chatId);
+    db.prepare('UPDATE users SET referred_by = ? WHERE chat_id = ? AND referred_by IS NULL').run(referrerChatId, chatId);
   },
   addDiscount(chatId, amount) {
     db.prepare('UPDATE users SET discount = discount + ? WHERE chat_id = ?').run(amount, String(chatId));
@@ -194,10 +212,7 @@ const usersDb = {
 
 const reviewsDb = {
   add(review) {
-    db.prepare(`
-      INSERT INTO reviews (order_id, buyer_chat_id, buyer_name, stars, text)
-      VALUES (@order_id, @buyer_chat_id, @buyer_name, @stars, @text)
-    `).run(review);
+    db.prepare('INSERT INTO reviews (order_id, buyer_chat_id, buyer_name, stars, text) VALUES (@order_id, @buyer_chat_id, @buyer_name, @stars, @text)').run(review);
   },
   getAll() {
     return db.prepare('SELECT * FROM reviews ORDER BY created_at DESC').all();
@@ -228,6 +243,31 @@ const spamDb = {
 
 setInterval(() => spamDb.cleanup(), 60 * 60 * 1000);
 
+// Проверка истёкших аренд каждые 10 минут
+setInterval(async () => {
+  const expired = ordersDb.getExpiredRentals();
+  for (const order of expired) {
+    ordersDb.update(order.order_id, { status: 'expired' });
+    accountsDb.setRented(order.account_id, false);
+    try {
+      await bot.telegram.sendMessage(
+        Number(order.buyer_chat_id),
+        `⏰ *Аренда завершена\\!*\n\n` +
+        `Аккаунт *${escapeMarkdown(order.account_title)}* больше не в вашем распоряжении\\.\n\n` +
+        `Хотите продлить или купить насовсем? Напишите @brawlhelpp`,
+        { parse_mode: 'MarkdownV2' }
+      );
+    } catch (e) {}
+    await notifyAdmin(
+      `⏰ *Аренда истекла*\n\n` +
+      `Заказ: *\\#${escapeMarkdown(order.order_id)}*\n` +
+      `👤 ${escapeMarkdown(order.buyer_name)}\n` +
+      `🎮 ${escapeMarkdown(order.account_title)}\n` +
+      `📧 ${escapeMarkdown(order.email || '—')}`
+    );
+  }
+}, 10 * 60 * 1000);
+
 // =====================
 // УТИЛИТЫ
 // =====================
@@ -252,6 +292,7 @@ function statusLabel(status) {
     fulfilled: '🟢 Завершён',
     rejected: '🔴 Отклонён',
     cancelled: '⚫ Отменён',
+    expired: '🕐 Аренда истекла',
   };
   return map[status] || status;
 }
@@ -265,6 +306,12 @@ function generateOrderId() {
   return crypto.randomBytes(4).toString('hex').toUpperCase();
 }
 
+function rentUntilDate(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
 // =====================
 // БОТ
 // =====================
@@ -274,8 +321,13 @@ bot.use(session());
 const pendingEmailByChatId = new Map();
 const pendingMainMsgStore = new Map();
 const pendingLastOrderStore = new Map();
+const verifiedAdmins = new Set();
 
 function isAdmin(ctx) {
+  return String(ctx.chat?.id) === String(ADMIN_CHAT_ID) && verifiedAdmins.has(String(ctx.chat?.id));
+}
+
+function isAdminChat(ctx) {
   return String(ctx.chat?.id) === String(ADMIN_CHAT_ID);
 }
 
@@ -320,7 +372,7 @@ async function notifyAdmin(text, keyboard) {
 // =====================
 // ЭКРАНЫ КАТАЛОГА
 // =====================
-function buildCatalogScreen(index, discount = 0) {
+function buildCatalogScreen(index, discount = 0, mode = 'buy') {
   const accounts = accountsDb.getAll();
 
   if (accounts.length === 0) {
@@ -334,20 +386,29 @@ function buildCatalogScreen(index, discount = 0) {
 
   const i = Math.max(0, Math.min(index, accounts.length - 1));
   const account = accounts[i];
-  const finalPrice = Math.max(0, account.price - discount);
+  const finalPrice = mode === 'buy' ? Math.max(0, account.price - discount) : 0;
 
   let caption =
     `🏆 *${escapeMarkdown(account.title)}*\n\n` +
     `🥇 Кубки: *${account.trophies.toLocaleString('ru-RU')}*\n` +
     `⚔️ Бойцы: *${account.fighters}*\n` +
-    `📅 Год: *${account.year}*\n`;
+    `📅 Год: *${account.year}*\n\n`;
 
-  if (discount > 0) {
-    caption +=
-      `💰 Цена: *${escapeMarkdown(formatPrice(account.price))}* → *${escapeMarkdown(formatPrice(finalPrice))}*\n` +
-      `🎁 Скидка: *${escapeMarkdown(formatPrice(discount))}*\n`;
-  } else {
-    caption += `💰 Цена: *${escapeMarkdown(formatPrice(account.price))}*\n`;
+  caption += `💰 *Купить:* ${escapeMarkdown(formatPrice(account.price))}`;
+  if (discount > 0 && mode === 'buy') {
+    caption += ` → *${escapeMarkdown(formatPrice(finalPrice))}* 🎁`;
+  }
+  caption += '\n';
+
+  if (account.rent_price_day > 0) {
+    caption += `📅 *Аренда 1 день:* ${escapeMarkdown(formatPrice(account.rent_price_day))}\n`;
+  }
+  if (account.rent_price_week > 0) {
+    caption += `📆 *Аренда 7 дней:* ${escapeMarkdown(formatPrice(account.rent_price_week))}\n`;
+  }
+
+  if (account.rented) {
+    caption += `\n⚠️ _Сейчас в аренде_`;
   }
 
   caption += `\n📦 Аккаунт ${i + 1} из ${accounts.length}`;
@@ -358,7 +419,16 @@ function buildCatalogScreen(index, discount = 0) {
 
   const rows = [];
   if (navRow.length > 0) rows.push(navRow);
-  rows.push([{ text: `🛒 Купить за ${formatPrice(finalPrice)}`, callback_data: `buy_${account.id}` }]);
+
+  if (!account.rented) {
+    rows.push([{ text: `🛒 Купить за ${formatPrice(finalPrice)}`, callback_data: `buy_${account.id}` }]);
+    if (account.rent_price_day > 0 || account.rent_price_week > 0) {
+      rows.push([{ text: `🔑 Арендовать`, callback_data: `rent_${account.id}` }]);
+    }
+  } else {
+    rows.push([{ text: `🛒 Купить за ${formatPrice(finalPrice)}`, callback_data: `buy_${account.id}` }]);
+    rows.push([{ text: `⏳ Аренда недоступна`, callback_data: `rent_busy` }]);
+  }
 
   return {
     type: 'photo',
@@ -371,14 +441,71 @@ function buildCatalogScreen(index, discount = 0) {
 }
 
 // =====================
-// ЭКРАНЫ ПОКУПАТЕЛЯ
+// ЭКРАНЫ АРЕНДЫ
 // =====================
-function screenPayment(account, finalPrice) {
+function screenRentOptions(account, discount) {
+  const rows = [];
+
+  if (account.rent_price_day > 0) {
+    rows.push([{
+      text: `📅 1 день — ${formatPrice(account.rent_price_day)}`,
+      callback_data: `rentpay_${account.id}_1`,
+    }]);
+  }
+  if (account.rent_price_week > 0) {
+    rows.push([{
+      text: `📆 7 дней — ${formatPrice(account.rent_price_week)}`,
+      callback_data: `rentpay_${account.id}_7`,
+    }]);
+  }
+
+  rows.push([{ text: '◀ Назад в каталог', callback_data: 'back_catalog' }]);
+
   return {
     type: 'text',
     text:
-      `💳 *Оплата заказа*\n\n` +
+      `🔑 *Аренда аккаунта*\n\n` +
+      `🏆 *${escapeMarkdown(account.title)}*\n\n` +
+      `Выберите срок аренды:\n\n` +
+      (account.rent_price_day > 0 ? `📅 1 день — *${escapeMarkdown(formatPrice(account.rent_price_day))}*\n` : '') +
+      (account.rent_price_week > 0 ? `📆 7 дней — *${escapeMarkdown(formatPrice(account.rent_price_week))}*\n` : '') +
+      `\n⚠️ _Аккаунт будет доступен только на выбранный срок_`,
+    keyboard: { inline_keyboard: rows },
+  };
+}
+
+function screenRentPayment(account, days, price) {
+  const label = days === 1 ? '1 день' : `${days} дней`;
+  return {
+    type: 'text',
+    text:
+      `💳 *Оплата аренды*\n\n` +
+      `🏆 *${escapeMarkdown(account.title)}*\n` +
+      `⏱ Срок: *${escapeMarkdown(label)}*\n` +
+      `💰 Сумма: *${escapeMarkdown(formatPrice(price))}*\n\n` +
+      `📱 *Реквизиты СБП:*\n` +
+      `📞 Номер: *\\+7 902 917\\-54\\-45*\n\n` +
+      `Переведите сумму, затем нажмите кнопку 👇`,
+    keyboard: {
+      inline_keyboard: [
+        [{ text: '✅ Я оплатил', callback_data: `rentpaid_${account.id}_${days}` }],
+        [{ text: '◀ Назад', callback_data: `rent_${account.id}` }],
+      ],
+    },
+  };
+}
+
+// =====================
+// ЭКРАНЫ ПОКУПАТЕЛЯ
+// =====================
+function screenPayment(account, finalPrice, type = 'buy', days = 0) {
+  const label = type === 'rent' ? (days === 1 ? '1 день' : `${days} дней`) : null;
+  return {
+    type: 'text',
+    text:
+      `💳 *Оплата ${type === 'rent' ? 'аренды' : 'заказа'}*\n\n` +
       `🎮 Аккаунт: *${escapeMarkdown(account.title)}*\n` +
+      (label ? `⏱ Срок аренды: *${escapeMarkdown(label)}*\n` : '') +
       `💰 Сумма к оплате: *${escapeMarkdown(formatPrice(finalPrice))}*\n\n` +
       `📱 *Реквизиты СБП:*\n` +
       `📞 Номер: *\\+7 902 917\\-54\\-45*\n\n` +
@@ -392,7 +519,8 @@ function screenPayment(account, finalPrice) {
   };
 }
 
-function screenEnterName(account, finalPrice) {
+function screenEnterName(account, finalPrice, type = 'buy', days = 0) {
+  const label = type === 'rent' ? (days === 1 ? '1 день' : `${days} дней`) : null;
   return {
     type: 'text',
     text:
@@ -401,6 +529,7 @@ function screenEnterName(account, finalPrice) {
       `_Например: Александр К_\n\n` +
       `⚠️ Укажите имя точно как в банке при переводе\\.\n\n` +
       `💰 Сумма: *${escapeMarkdown(formatPrice(finalPrice))}*\n` +
+      (label ? `⏱ Срок: *${escapeMarkdown(label)}*\n` : '') +
       `📞 На номер: *\\+7 902 917\\-54\\-45*`,
     keyboard: {
       inline_keyboard: [
@@ -410,13 +539,14 @@ function screenEnterName(account, finalPrice) {
   };
 }
 
-function screenWaiting(orderId, buyerName) {
+function screenWaiting(orderId, buyerName, type = 'buy') {
   return {
     type: 'text',
     text:
       `⏳ *Ожидайте подтверждения*\n\n` +
       `Заказ: *\\#${escapeMarkdown(orderId)}*\n` +
-      `Имя: *${escapeMarkdown(buyerName)}*\n\n` +
+      `Имя: *${escapeMarkdown(buyerName)}*\n` +
+      `Тип: *${type === 'rent' ? 'Аренда' : 'Покупка'}*\n\n` +
       `Продавец проверяет ваш перевод по имени\\.\n` +
       `Как только оплата подтвердится — бот сообщит вам\\.`,
     keyboard: {
@@ -449,13 +579,20 @@ function screenCodeWaiting() {
   };
 }
 
-function screenSuccess(accountTitle) {
+function screenSuccess(accountTitle, type = 'buy', rentUntil = null) {
+  let text =
+    `🎉 *Поздравляем\\! ${type === 'rent' ? 'Аренда активирована\\!' : 'Заказ завершён\\!'}*\n\n` +
+    `🏆 Аккаунт *${escapeMarkdown(accountTitle)}* ${type === 'rent' ? 'в вашем распоряжении' : 'передан вам'}\\.\n\n`;
+
+  if (type === 'rent' && rentUntil) {
+    text += `⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*\n\n`;
+  }
+
+  text += `Спасибо за покупку\\! По вопросам: @brawlhelpp`;
+
   return {
     type: 'text',
-    text:
-      `🎉 *Поздравляем\\! Заказ завершён\\!*\n\n` +
-      `🏆 Аккаунт *${escapeMarkdown(accountTitle)}* передан вам\\.\n\n` +
-      `Спасибо за покупку\\! По вопросам: @brawlhelpp`,
+    text,
     keyboard: {
       inline_keyboard: [
         [{ text: '⭐ Оставить отзыв', callback_data: 'leave_review' }],
@@ -507,9 +644,7 @@ function screenReviewText(stars) {
       `Напишите короткий отзыв о покупке\\.\n` +
       `_Или нажмите "Пропустить"_`,
     keyboard: {
-      inline_keyboard: [
-        [{ text: 'Пропустить', callback_data: 'skip_review' }],
-      ],
+      inline_keyboard: [[{ text: 'Пропустить', callback_data: 'skip_review' }]],
     },
   };
 }
@@ -519,12 +654,39 @@ function screenReviewDone() {
     type: 'text',
     text: `✅ *Спасибо за отзыв\\!*\n\nЭто помогает нам становиться лучше 🙏`,
     keyboard: {
-      inline_keyboard: [
-        [{ text: '🏠 В каталог', callback_data: 'back_catalog' }],
-      ],
+      inline_keyboard: [[{ text: '🏠 В каталог', callback_data: 'back_catalog' }]],
     },
   };
 }
+
+// =====================
+// РЕГИСТРАЦИЯ КОМАНД
+// =====================
+bot.telegram.setMyCommands([
+  { command: 'start', description: '🏠 Главное меню' },
+  { command: 'catalog', description: '📋 Каталог аккаунтов' },
+  { command: 'ref', description: '🔗 Моя реферальная ссылка' },
+  { command: 'myorders', description: '📦 Мои заказы' },
+  { command: 'help', description: '❓ Помощь' },
+]).catch(e => console.warn('setMyCommands error:', e.message));
+
+// Команды только для админа (показываются только ему через BotFather → /setmycommands с scope)
+// Для простоты — просто добавляем обработчики
+bot.telegram.setMyCommands([
+  { command: 'start', description: '🏠 Главное меню' },
+  { command: 'catalog', description: '📋 Каталог аккаунтов' },
+  { command: 'ref', description: '🔗 Моя реферальная ссылка' },
+  { command: 'myorders', description: '📦 Мои заказы' },
+  { command: 'help', description: '❓ Помощь' },
+  { command: 'login', description: '🔐 Войти как администратор' },
+  { command: 'logout', description: '🚪 Выйти из администратора' },
+  { command: 'orders', description: '📋 Все заказы' },
+  { command: 'stats', description: '📊 Статистика' },
+  { command: 'reviews', description: '⭐ Отзывы' },
+  { command: 'accounts', description: '🗂 Все аккаунты' },
+], {
+  scope: { type: 'chat', chat_id: Number(ADMIN_CHAT_ID) },
+}).catch(e => console.warn('setMyCommands admin error:', e.message));
 
 // =====================
 // СТАРТ
@@ -536,14 +698,13 @@ bot.start(async (ctx) => {
 
   usersDb.upsert(chatId, username);
 
-  // Реферальная ссылка
   const startPayload = ctx.startPayload;
   if (startPayload && startPayload.startsWith('REF')) {
     const referrer = usersDb.getByRefCode(startPayload);
     if (referrer && referrer.chat_id !== chatId) {
       usersDb.setReferredBy(chatId, referrer.chat_id);
       await tempMsg(chatId,
-        `🎁 Вы пришли по реферальной ссылке!\n\nПри первой покупке скидка 100 ₽ уже применится автоматически!`,
+        `🎁 Вы пришли по реферальной ссылке!\n\nПри первой покупке скидка 100 ₽ применится автоматически!`,
         7000
       );
     }
@@ -554,6 +715,27 @@ bot.start(async (ctx) => {
     ? `\n\n🎁 У вас есть скидка *${escapeMarkdown(formatPrice(discount))}* на следующую покупку\\!`
     : '';
 
+  if (chatId === String(ADMIN_CHAT_ID)) {
+    const isVerified = verifiedAdmins.has(chatId);
+    await ctx.reply(
+      `👋 Привет, Администратор\\!${discountLine}\n\n` +
+      (isVerified ? `✅ Вы авторизованы\\.` : `🔐 Войдите: /login пароль`),
+      {
+        parse_mode: 'MarkdownV2',
+        reply_markup: {
+          keyboard: [
+            [{ text: '📋 Каталог аккаунтов' }, { text: '📊 Статистика' }],
+            [{ text: '📦 Все заказы' }, { text: '⭐ Отзывы' }],
+            [{ text: '➕ Добавить аккаунт' }, { text: '🗂 Мои аккаунты' }],
+            [{ text: '🔗 Моя реферальная ссылка' }, { text: '❓ Помощь' }],
+          ],
+          resize_keyboard: true,
+        },
+      }
+    );
+    return;
+  }
+
   await ctx.reply(
     `👋 Привет\\! Это магазин аккаунтов Brawl Stars\\.${discountLine}\n\nВыбери действие:`,
     {
@@ -561,7 +743,8 @@ bot.start(async (ctx) => {
       reply_markup: {
         keyboard: [
           [{ text: '📋 Каталог аккаунтов' }],
-          [{ text: '🔗 Моя реферальная ссылка' }, { text: '❓ Помощь' }],
+          [{ text: '📦 Мои заказы' }, { text: '🔗 Моя реферальная ссылка' }],
+          [{ text: '❓ Помощь' }],
         ],
         resize_keyboard: true,
       },
@@ -570,68 +753,125 @@ bot.start(async (ctx) => {
 });
 
 // =====================
-// КОМАНДЫ АДМИНА
+// КОМАНДЫ ПОКУПАТЕЛЯ
 // =====================
-bot.command('orders', async (ctx) => {
-  if (!isAdmin(ctx)) return;
+bot.command('catalog', async (ctx) => {
+  ctx.session = ctx.session || {};
+  ctx.session.step = 'catalog';
+  ctx.session.catalogIndex = 0;
+  const discount = getUserDiscount(ctx.chat.id);
+  const screen = buildCatalogScreen(0, discount);
+  ctx.session.catalogIndex = screen.accountIndex ?? 0;
+  await goTo(ctx.chat.id, ctx.session, screen);
+});
 
-  const all = ordersDb.getRecent(20);
-  const active = ordersDb.getActive();
+bot.command('ref', async (ctx) => {
+  const user = usersDb.get(String(ctx.chat.id));
+  if (!user) return;
+  const botUsername = ctx.botInfo?.username || 'yourbot';
+  const link = `https://t.me/${botUsername}?start=${user.ref_code}`;
+  const discount = getUserDiscount(ctx.chat.id);
+  await ctx.reply(
+    `🔗 *Ваша реферальная ссылка:*\n\n\`${link}\`\n\n` +
+    `Поделитесь с другом\\. Когда он купит — вы получите скидку *100 ₽*\\!\n\n` +
+    (discount > 0 ? `🎁 Ваша текущая скидка: *${escapeMarkdown(formatPrice(discount))}*` : `💡 Пригласите друга и получите скидку\\.`),
+    { parse_mode: 'MarkdownV2' }
+  );
+});
 
-  if (all.length === 0) return ctx.reply('📭 Заказов пока нет.');
+bot.command('myorders', async (ctx) => {
+  const orders = ordersDb.getByChatId(String(ctx.chat.id)).slice(0, 10);
+  if (orders.length === 0) return ctx.reply('📭 У вас ещё нет заказов.');
 
-  let text = `📋 *Заказы* \\(последние ${all.length}\\)\n🔴 Активных: *${active.length}*\n\n`;
-
-  for (const o of all) {
+  let text = `📦 *Ваши заказы:*\n\n`;
+  for (const o of orders) {
     text += `*\\#${escapeMarkdown(o.order_id)}* — ${escapeMarkdown(statusLabel(o.status))}\n`;
-    text += `👤 ${escapeMarkdown(o.buyer_name)}`;
-    if (o.email) text += ` • 📧 ${escapeMarkdown(o.email)}`;
-    text += `\n💰 ${escapeMarkdown(formatPrice(o.price))}`;
+    text += `🎮 ${escapeMarkdown(o.account_title || '—')}`;
+    text += ` • ${o.type === 'rent' ? '🔑 Аренда' : '🛒 Покупка'}\n`;
+    text += `💰 ${escapeMarkdown(formatPrice(o.price))}`;
     if (o.discount > 0) text += ` \\(−${escapeMarkdown(formatPrice(o.discount))}\\)`;
-    text += ` • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n`;
-    if (o.status === 'pending') {
-      text += `_→ /confirm\\_${o.order_id} или /reject\\_${o.order_id}_\n`;
-    } else if (o.status === 'code_received') {
-      text += `_→ /complete\\_${o.order_id} или /reject\\_${o.order_id}_\n`;
-    }
-    text += '\n';
+    text += ` • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n\n`;
   }
 
   await ctx.reply(text, { parse_mode: 'MarkdownV2' });
 });
 
-bot.command('order', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const id = ctx.message.text.split(' ')[1]?.toUpperCase();
-  if (!id) return ctx.reply('Использование: /order ID');
+bot.command('help', async (ctx) => {
+  const isAdm = isAdminChat(ctx);
+  let text =
+    `❓ *Помощь*\n\n` +
+    `*Как купить аккаунт:*\n` +
+    `1️⃣ Нажмите 📋 Каталог аккаунтов\n` +
+    `2️⃣ Выберите аккаунт\n` +
+    `3️⃣ Нажмите "Купить" или "Арендовать"\n` +
+    `4️⃣ Оплатите через СБП на указанный номер\n` +
+    `5️⃣ Нажмите "Я оплатил"\n` +
+    `6️⃣ Введите имя как в банке\n` +
+    `7️⃣ Дождитесь подтверждения\n` +
+    `8️⃣ Введите email → получите код\n` +
+    `9️⃣ Введите код из письма\n` +
+    `🔟 Готово\\! 🏆\n\n` +
+    `*Аренда:*\n` +
+    `🔑 Аккаунт доступен на выбранный срок \\(1 или 7 дней\\)\\.\n` +
+    `По истечении срока доступ закрывается автоматически\\.\n\n` +
+    `📞 По вопросам: @brawlhelpp`;
 
-  const o = ordersDb.get(id);
-  if (!o) return ctx.reply(`❌ Заказ #${id} не найден.`);
-
-  const buttons = [];
-  if (o.status === 'pending') {
-    buttons.push([
-      { text: '✅ Подтвердить', callback_data: `fulfill_${o.order_id}` },
-      { text: '❌ Отклонить', callback_data: `reject_${o.order_id}` },
-    ]);
-  } else if (o.status === 'code_received') {
-    buttons.push([
-      { text: '✅ Завершить', callback_data: `complete_${o.order_id}` },
-      { text: '❌ Отклонить', callback_data: `reject_${o.order_id}` },
-    ]);
+  if (isAdm) {
+    text +=
+      `\n\n*Команды администратора:*\n` +
+      `/login — войти в панель\n` +
+      `/orders — все заказы\n` +
+      `/stats — статистика\n` +
+      `/reviews — отзывы\n` +
+      `/accounts — все аккаунты\n` +
+      `/myorders — мои заказы как покупателя`;
   }
 
-  let text =
-    `📦 *Заказ \\#${escapeMarkdown(o.order_id)}*\n\n` +
-    `${escapeMarkdown(statusLabel(o.status))}\n\n` +
-    `👤 Имя: *${escapeMarkdown(o.buyer_name)}*\n` +
-    `🎮 ${escapeMarkdown(o.account_title || '—')}\n` +
-    `💰 ${escapeMarkdown(formatPrice(o.price))}`;
-  if (o.discount > 0) text += ` \\(−${escapeMarkdown(formatPrice(o.discount))} скидка\\)`;
-  text += '\n';
-  if (o.email) text += `📧 ${escapeMarkdown(o.email)}\n`;
-  if (o.code) text += `🔑 Код: *${escapeMarkdown(o.code)}*\n`;
-  text += `🕐 ${escapeMarkdown(formatDate(o.created_at))}`;
+  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+});
+
+// =====================
+// КОМАНДЫ АДМИНА
+// =====================
+bot.command('login', async (ctx) => {
+  if (!isAdminChat(ctx)) return;
+  const password = ctx.message.text.split(' ')[1];
+  try { await ctx.deleteMessage(); } catch (e) {}
+  if (password === ADMIN_PASSWORD) {
+    verifiedAdmins.add(String(ctx.chat.id));
+    await ctx.reply('✅ Вы вошли как администратор. Все кнопки активны.');
+  } else {
+    await ctx.reply('❌ Неверный пароль.');
+  }
+});
+
+bot.command('logout', async (ctx) => {
+  if (!isAdminChat(ctx)) return;
+  verifiedAdmins.delete(String(ctx.chat.id));
+  await ctx.reply('👋 Вы вышли из панели администратора.');
+});
+
+bot.command('orders', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply('🔒 Нет доступа. Введите /login пароль');
+  const all = ordersDb.getRecent(20);
+  const active = ordersDb.getActive();
+  if (all.length === 0) return ctx.reply('📭 Заказов пока нет.');
+
+  let text = `📋 *Заказы* \\(последние ${all.length}\\)\n🔴 Активных: *${active.length}*\n\n`;
+  for (const o of all) {
+    text += `*\\#${escapeMarkdown(o.order_id)}* — ${escapeMarkdown(statusLabel(o.status))}`;
+    text += ` ${o.type === 'rent' ? '🔑' : '🛒'}\n`;
+    text += `👤 ${escapeMarkdown(o.buyer_name)}`;
+    if (o.email) text += ` • 📧 ${escapeMarkdown(o.email)}`;
+    text += `\n💰 ${escapeMarkdown(formatPrice(o.price))}`;
+    if (o.discount > 0) text += ` \\(−${escapeMarkdown(formatPrice(o.discount))}\\)`;
+    text += ` • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n\n`;
+  }
+
+  const buttons = active.slice(0, 5).map(o => ([{
+    text: `#${o.order_id} ${o.type === 'rent' ? '🔑' : '🛒'} ${statusLabel(o.status)}`,
+    callback_data: `admin_order_${o.order_id}`,
+  }]));
 
   await ctx.reply(text, {
     parse_mode: 'MarkdownV2',
@@ -640,122 +880,21 @@ bot.command('order', async (ctx) => {
 });
 
 bot.command('stats', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const s = ordersDb.getStats();
-  const rev = reviewsDb.getStats();
-  const accounts = accountsDb.getAllIncludingSold();
-  const available = accounts.filter(a => !a.sold).length;
-  const sold = accounts.filter(a => a.sold).length;
-
-  const text =
-    `📊 *Статистика магазина*\n\n` +
-    `📅 *Сегодня:*\n` +
-    `   Продаж: *${s.today.count}* на *${escapeMarkdown(formatPrice(s.today.revenue))}*\n\n` +
-    `📆 *За 7 дней:*\n` +
-    `   Продаж: *${s.week.count}* на *${escapeMarkdown(formatPrice(s.week.revenue))}*\n\n` +
-    `📈 *За всё время:*\n` +
-    `   Продаж: *${s.total.count}* на *${escapeMarkdown(formatPrice(s.total.revenue))}*\n\n` +
-    `⏳ Ожидают подтверждения: *${s.pending.count}*\n\n` +
-    `📦 *Каталог:*\n` +
-    `   Доступно: *${available}*  •  Продано: *${sold}*\n\n` +
-    `⭐ *Отзывы:*\n` +
-    `   Всего: *${rev.count}*  •  Средняя оценка: *${rev.avg ? rev.avg.toFixed(1) : '—'}*`;
-
-  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+  if (!isAdmin(ctx)) return ctx.reply('🔒 Нет доступа. Введите /login пароль');
+  await showStats(ctx);
 });
 
 bot.command('reviews', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const reviews = reviewsDb.getAll().slice(0, 10);
-  if (reviews.length === 0) return ctx.reply('📭 Отзывов пока нет.');
-
-  let text = `⭐ *Последние отзывы*\n\n`;
-  for (const r of reviews) {
-    text += `${'⭐'.repeat(r.stars)} — *${escapeMarkdown(r.buyer_name || 'Покупатель')}*\n`;
-    if (r.text) text += `_${escapeMarkdown(r.text)}_\n`;
-    text += `🕐 ${escapeMarkdown(formatDate(r.created_at))}\n\n`;
-  }
-
-  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
-});
-
-bot.command('addaccount', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  // Формат:
-  // /addaccount
-  // Название аккаунта
-  // кубки бойцы цена год
-  // https://ссылка-на-фото.jpg
-
-  const lines = ctx.message.text.split('\n').slice(1);
-
-  if (lines.length < 3) {
-    return ctx.reply(
-      '📝 Формат добавления:\n\n' +
-      '/addaccount\n' +
-      'Brawl Stars — 35 000 кубков\n' +
-      '35000 70 1200 2024\n' +
-      'https://ссылка-на-фото.jpg'
-    );
-  }
-
-  const title = lines[0].trim();
-  const stats = lines[1].trim().split(/\s+/);
-  const imageUrl = lines[2].trim();
-
-  if (stats.length < 4) {
-    return ctx.reply('❌ Во второй строке укажите: кубки бойцы цена год\nНапример: 35000 70 1200 2024');
-  }
-
-  const [trophies, fighters, price, year] = stats.map(Number);
-  if ([trophies, fighters, price, year].some(isNaN)) {
-    return ctx.reply('❌ Кубки, бойцы, цена и год должны быть числами.');
-  }
-
-  const id = 'acc-' + Date.now();
-  accountsDb.add({ id, title, trophies, fighters, price, year, image_url: imageUrl });
-
-  await ctx.reply(
-    `✅ Аккаунт добавлен в каталог!\n\n` +
-    `🏆 ${title}\n` +
-    `🥇 ${trophies.toLocaleString('ru-RU')} кубков\n` +
-    `⚔️ ${fighters} бойцов\n` +
-    `💰 ${formatPrice(price)}\n` +
-    `📅 ${year}\n` +
-    `🆔 ${id}`
-  );
-});
-
-bot.command('delaccount', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const id = ctx.message.text.split(' ')[1];
-  if (!id) return ctx.reply('Использование: /delaccount ID');
-
-  const account = accountsDb.getById(id);
-  if (!account) return ctx.reply(`❌ Аккаунт ${id} не найден.`);
-
-  accountsDb.delete(id);
-  await ctx.reply(`✅ Аккаунт "${account.title}" удалён из каталога.`);
+  if (!isAdmin(ctx)) return ctx.reply('🔒 Нет доступа. Введите /login пароль');
+  await showReviews(ctx);
 });
 
 bot.command('accounts', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const all = accountsDb.getAllIncludingSold();
-  if (all.length === 0) return ctx.reply('📭 Аккаунтов нет.');
-
-  let text = `📦 *Все аккаунты:*\n\n`;
-  for (const a of all) {
-    text += `${a.sold ? '🔴 Продан' : '🟢 Доступен'} — *${escapeMarkdown(a.title)}*\n`;
-    text += `💰 ${escapeMarkdown(formatPrice(a.price))} • 🥇 ${a.trophies.toLocaleString('ru-RU')}\n`;
-    text += `🆔 \`${escapeMarkdown(a.id)}\`\n\n`;
-  }
-
-  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+  if (!isAdmin(ctx)) return ctx.reply('🔒 Нет доступа. Введите /login пароль');
+  await showAccounts(ctx);
 });
 
-// Быстрые команды
+// Быстрые команды подтверждения
 bot.hears(/^\/confirm_([A-F0-9]+)$/i, async (ctx) => {
   if (!isAdmin(ctx)) return;
   await handleFulfill(ctx, ctx.match[1].toUpperCase());
@@ -770,7 +909,69 @@ bot.hears(/^\/complete_([A-F0-9]+)$/i, async (ctx) => {
 });
 
 // =====================
-// КАТАЛОГ — кнопки
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ АДМИНА
+// =====================
+async function showStats(ctx) {
+  const s = ordersDb.getStats();
+  const rev = reviewsDb.getStats();
+  const accounts = accountsDb.getAllIncludingSold();
+  const available = accounts.filter(a => !a.sold).length;
+  const sold = accounts.filter(a => a.sold).length;
+
+  const text =
+    `📊 *Статистика магазина*\n\n` +
+    `📅 *Сегодня:*\n   Продаж: *${s.today.count}* на *${escapeMarkdown(formatPrice(s.today.revenue))}*\n\n` +
+    `📆 *За 7 дней:*\n   Продаж: *${s.week.count}* на *${escapeMarkdown(formatPrice(s.week.revenue))}*\n\n` +
+    `📈 *За всё время:*\n   Продаж: *${s.total.count}* на *${escapeMarkdown(formatPrice(s.total.revenue))}*\n\n` +
+    `⏳ Ожидают: *${s.pending.count}*\n` +
+    `🔑 Активных аренд: *${s.rentActive.count}*\n\n` +
+    `📦 *Каталог:*\n   Доступно: *${available}*  •  Продано: *${sold}*\n\n` +
+    `⭐ *Отзывы:*\n   Всего: *${rev.count}*  •  Средняя: *${rev.avg ? rev.avg.toFixed(1) : '—'}*`;
+
+  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+}
+
+async function showReviews(ctx) {
+  const reviews = reviewsDb.getAll().slice(0, 10);
+  if (reviews.length === 0) return ctx.reply('📭 Отзывов пока нет.');
+
+  let text = `⭐ *Последние отзывы*\n\n`;
+  for (const r of reviews) {
+    text += `${'⭐'.repeat(r.stars)} — *${escapeMarkdown(r.buyer_name || 'Покупатель')}*\n`;
+    if (r.text) text += `_${escapeMarkdown(r.text)}_\n`;
+    text += `🕐 ${escapeMarkdown(formatDate(r.created_at))}\n\n`;
+  }
+
+  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+}
+
+async function showAccounts(ctx) {
+  const all = accountsDb.getAllIncludingSold();
+  if (all.length === 0) return ctx.reply('📭 Аккаунтов нет.');
+
+  let text = `📦 *Все аккаунты:*\n\n`;
+  const buttons = [];
+
+  for (const a of all) {
+    const rentInfo = a.rent_price_day > 0
+      ? ` • 🔑 ${formatPrice(a.rent_price_day)}/день`
+      : '';
+    text += `${a.sold ? '🔴 Продан' : a.rented ? '🟡 В аренде' : '🟢 Доступен'} — *${escapeMarkdown(a.title)}*\n`;
+    text += `💰 ${escapeMarkdown(formatPrice(a.price))}${escapeMarkdown(rentInfo)} • 🥇 ${a.trophies.toLocaleString('ru-RU')}\n`;
+    text += `\`${escapeMarkdown(a.id)}\`\n\n`;
+    if (!a.sold) {
+      buttons.push([{ text: `🗑 Удалить: ${a.title}`, callback_data: `del_acc_${a.id}` }]);
+    }
+  }
+
+  await ctx.reply(text, {
+    parse_mode: 'MarkdownV2',
+    reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined,
+  });
+}
+
+// =====================
+// КНОПКИ КАТАЛОГА
 // =====================
 bot.hears('📋 Каталог аккаунтов', async (ctx) => {
   ctx.session = ctx.session || {};
@@ -803,7 +1004,7 @@ bot.action('back_catalog', async (ctx) => {
 });
 
 // =====================
-// ПОКУПКА — кнопки
+// КНОПКИ ПОКУПКИ
 // =====================
 bot.action(/^buy_(.+)$/, async (ctx) => {
   ctx.session = ctx.session || {};
@@ -812,8 +1013,7 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
 
   if (!account || account.sold) {
     await ctx.answerCbQuery('❌ Этот аккаунт уже продан');
-    const screen = buildCatalogScreen(0, getUserDiscount(chatId));
-    await goTo(chatId, ctx.session, screen);
+    await goTo(chatId, ctx.session, buildCatalogScreen(0, getUserDiscount(chatId)));
     return;
   }
 
@@ -826,11 +1026,13 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
   const discount = getUserDiscount(chatId);
   ctx.session.selectedAccountId = account.id;
   ctx.session.pendingDiscount = discount;
+  ctx.session.orderType = 'buy';
+  ctx.session.rentDays = 0;
   ctx.session.step = 'payment';
   const finalPrice = Math.max(0, account.price - discount);
 
   await ctx.answerCbQuery();
-  await goTo(chatId, ctx.session, screenPayment(account, finalPrice));
+  await goTo(chatId, ctx.session, screenPayment(account, finalPrice, 'buy'));
 });
 
 bot.action(/^back_payment_(.+)$/, async (ctx) => {
@@ -840,7 +1042,7 @@ bot.action(/^back_payment_(.+)$/, async (ctx) => {
   ctx.session.step = 'payment';
   const finalPrice = Math.max(0, account.price - (ctx.session.pendingDiscount || 0));
   await ctx.answerCbQuery();
-  await goTo(ctx.chat.id, ctx.session, screenPayment(account, finalPrice));
+  await goTo(ctx.chat.id, ctx.session, screenPayment(account, finalPrice, ctx.session.orderType || 'buy', ctx.session.rentDays || 0));
 });
 
 bot.action(/^paid_(.+)$/, async (ctx) => {
@@ -853,17 +1055,13 @@ bot.action(/^paid_(.+)$/, async (ctx) => {
     return;
   }
 
-  // Антиспам: не более 2 нажатий за 30 минут
   if (spamDb.check(String(chatId), 'paid', 2, 30)) {
     await ctx.answerCbQuery('⛔ Слишком много попыток');
-    await tempMsg(chatId,
-      '⛔ Вы слишком часто нажимаете "Я оплатил".\n\nЕсли есть проблемы — напишите @brawlhelpp'
-    );
+    await tempMsg(chatId, '⛔ Вы слишком часто нажимаете "Я оплатил".\nЕсли есть проблемы — напишите @brawlhelpp');
     return;
   }
   spamDb.log(String(chatId), 'paid');
 
-  // Защита от двойного заказа
   if (ordersDb.hasPendingOrder(String(chatId))) {
     await ctx.answerCbQuery('⚠️ У вас уже есть активный заказ!');
     await tempMsg(chatId, '⚠️ У вас уже есть активный заказ. Дождитесь его завершения.');
@@ -872,9 +1070,12 @@ bot.action(/^paid_(.+)$/, async (ctx) => {
 
   ctx.session.selectedAccountId = account.id;
   ctx.session.step = 'awaiting_name';
-  const finalPrice = Math.max(0, account.price - (ctx.session.pendingDiscount || 0));
+  const finalPrice = ctx.session.orderType === 'rent'
+    ? (ctx.session.rentDays === 1 ? account.rent_price_day : account.rent_price_week)
+    : Math.max(0, account.price - (ctx.session.pendingDiscount || 0));
+
   await ctx.answerCbQuery();
-  await goTo(chatId, ctx.session, screenEnterName(account, finalPrice));
+  await goTo(chatId, ctx.session, screenEnterName(account, finalPrice, ctx.session.orderType || 'buy', ctx.session.rentDays || 0));
 });
 
 bot.action(/^cancel_(.+)$/, async (ctx) => {
@@ -890,12 +1091,104 @@ bot.action(/^cancel_(.+)$/, async (ctx) => {
   }
   ctx.session.step = 'catalog';
   await ctx.answerCbQuery('Заказ отменён');
-  const screen = buildCatalogScreen(ctx.session.catalogIndex || 0, getUserDiscount(ctx.chat.id));
-  await goTo(ctx.chat.id, ctx.session, screen);
+  await goTo(ctx.chat.id, ctx.session, buildCatalogScreen(ctx.session.catalogIndex || 0, getUserDiscount(ctx.chat.id)));
 });
 
 // =====================
-// ОТЗЫВЫ — кнопки
+// КНОПКИ АРЕНДЫ
+// =====================
+bot.action('rent_busy', async (ctx) => {
+  await ctx.answerCbQuery('⏳ Этот аккаунт сейчас в аренде');
+});
+
+bot.action(/^rent_(.+)$/, async (ctx) => {
+  ctx.session = ctx.session || {};
+  const account = accountsDb.getById(ctx.match[1]);
+
+  if (!account || account.sold) {
+    await ctx.answerCbQuery('❌ Аккаунт недоступен');
+    return;
+  }
+
+  if (account.rented) {
+    await ctx.answerCbQuery('⏳ Аккаунт сейчас в аренде');
+    await tempMsg(ctx.chat.id, '⏳ Этот аккаунт сейчас в аренде. Попробуйте позже или выберите другой.');
+    return;
+  }
+
+  if (ordersDb.hasPendingOrder(String(ctx.chat.id))) {
+    await ctx.answerCbQuery('⚠️ У вас уже есть активный заказ!');
+    await tempMsg(ctx.chat.id, '⚠️ У вас уже есть активный заказ.');
+    return;
+  }
+
+  ctx.session.selectedAccountId = account.id;
+  ctx.session.orderType = 'rent';
+  ctx.session.step = 'rent_options';
+
+  await ctx.answerCbQuery();
+  await goTo(ctx.chat.id, ctx.session, screenRentOptions(account, getUserDiscount(ctx.chat.id)));
+});
+
+bot.action(/^rentpay_(.+)_(\d+)$/, async (ctx) => {
+  ctx.session = ctx.session || {};
+  const accountId = ctx.match[1];
+  const days = parseInt(ctx.match[2], 10);
+  const account = accountsDb.getById(accountId);
+
+  if (!account || account.sold || account.rented) {
+    await ctx.answerCbQuery('❌ Аккаунт недоступен');
+    return;
+  }
+
+  const price = days === 1 ? account.rent_price_day : account.rent_price_week;
+  ctx.session.selectedAccountId = account.id;
+  ctx.session.orderType = 'rent';
+  ctx.session.rentDays = days;
+  ctx.session.pendingDiscount = 0;
+  ctx.session.step = 'payment';
+
+  await ctx.answerCbQuery();
+  await goTo(ctx.chat.id, ctx.session, screenRentPayment(account, days, price));
+});
+
+bot.action(/^rentpaid_(.+)_(\d+)$/, async (ctx) => {
+  ctx.session = ctx.session || {};
+  const chatId = ctx.chat.id;
+  const accountId = ctx.match[1];
+  const days = parseInt(ctx.match[2], 10);
+  const account = accountsDb.getById(accountId);
+
+  if (!account || account.sold || account.rented) {
+    await ctx.answerCbQuery('❌ Аккаунт недоступен');
+    return;
+  }
+
+  if (spamDb.check(String(chatId), 'paid', 2, 30)) {
+    await ctx.answerCbQuery('⛔ Слишком много попыток');
+    return;
+  }
+  spamDb.log(String(chatId), 'paid');
+
+  if (ordersDb.hasPendingOrder(String(chatId))) {
+    await ctx.answerCbQuery('⚠️ У вас уже есть активный заказ!');
+    return;
+  }
+
+  ctx.session.selectedAccountId = account.id;
+  ctx.session.orderType = 'rent';
+  ctx.session.rentDays = days;
+  ctx.session.pendingDiscount = 0;
+  ctx.session.step = 'awaiting_name';
+
+  const price = days === 1 ? account.rent_price_day : account.rent_price_week;
+
+  await ctx.answerCbQuery();
+  await goTo(chatId, ctx.session, screenEnterName(account, price, 'rent', days));
+});
+
+// =====================
+// КНОПКИ ОТЗЫВОВ
 // =====================
 bot.action('leave_review', async (ctx) => {
   ctx.session = ctx.session || {};
@@ -927,12 +1220,11 @@ bot.action('skip_review', async (ctx) => {
   }
   ctx.session.step = 'catalog';
   await ctx.answerCbQuery();
-  const screen = buildCatalogScreen(0, getUserDiscount(ctx.chat.id));
-  await goTo(ctx.chat.id, ctx.session, screen);
+  await goTo(ctx.chat.id, ctx.session, buildCatalogScreen(0, getUserDiscount(ctx.chat.id)));
 });
 
 // =====================
-// РЕФЕРАЛЬНАЯ ССЫЛКА
+// КНОПКИ РЕФЕРАЛА
 // =====================
 bot.hears('🔗 Моя реферальная ссылка', async (ctx) => {
   const user = usersDb.get(String(ctx.chat.id));
@@ -940,16 +1232,173 @@ bot.hears('🔗 Моя реферальная ссылка', async (ctx) => {
   const botUsername = ctx.botInfo?.username || 'yourbot';
   const link = `https://t.me/${botUsername}?start=${user.ref_code}`;
   const discount = getUserDiscount(ctx.chat.id);
-
   await ctx.reply(
-    `🔗 *Ваша реферальная ссылка:*\n\n` +
-    `\`${link}\`\n\n` +
-    `Поделитесь с другом\\. Когда он купит аккаунт — вы получите скидку *100 ₽* на следующую покупку\\!\n\n` +
-    (discount > 0
-      ? `🎁 Ваша текущая скидка: *${escapeMarkdown(formatPrice(discount))}*`
-      : `💡 Пригласите друга и получите скидку\\.`),
+    `🔗 *Ваша реферальная ссылка:*\n\n\`${link}\`\n\n` +
+    `Поделитесь с другом\\. Когда он купит — вы получите скидку *100 ₽*\\!\n\n` +
+    (discount > 0 ? `🎁 Ваша текущая скидка: *${escapeMarkdown(formatPrice(discount))}*` : `💡 Пригласите друга и получите скидку\\.`),
     { parse_mode: 'MarkdownV2' }
   );
+});
+
+// =====================
+// КНОПКИ АДМИНА
+// =====================
+bot.hears('📊 Статистика', async (ctx) => {
+  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await showStats(ctx);
+});
+
+bot.hears('📦 Все заказы', async (ctx) => {
+  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  const all = ordersDb.getRecent(20);
+  const active = ordersDb.getActive();
+  if (all.length === 0) return ctx.reply('📭 Заказов пока нет.');
+
+  let text = `📋 *Заказы* \\(последние ${all.length}\\)\n🔴 Активных: *${active.length}*\n\n`;
+  for (const o of all) {
+    text += `*\\#${escapeMarkdown(o.order_id)}* — ${escapeMarkdown(statusLabel(o.status))} ${o.type === 'rent' ? '🔑' : '🛒'}\n`;
+    text += `👤 ${escapeMarkdown(o.buyer_name)}`;
+    if (o.email) text += ` • 📧 ${escapeMarkdown(o.email)}`;
+    text += `\n💰 ${escapeMarkdown(formatPrice(o.price))} • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n\n`;
+  }
+
+  const buttons = active.slice(0, 5).map(o => ([{
+    text: `#${o.order_id} ${o.type === 'rent' ? '🔑' : '🛒'} ${statusLabel(o.status)}`,
+    callback_data: `admin_order_${o.order_id}`,
+  }]));
+
+  await ctx.reply(text, {
+    parse_mode: 'MarkdownV2',
+    reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined,
+  });
+});
+
+bot.hears('⭐ Отзывы', async (ctx) => {
+  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await showReviews(ctx);
+});
+
+bot.hears('🗂 Мои аккаунты', async (ctx) => {
+  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  await showAccounts(ctx);
+});
+
+bot.hears('📦 Мои заказы', async (ctx) => {
+  const orders = ordersDb.getByChatId(String(ctx.chat.id)).slice(0, 10);
+  if (orders.length === 0) return ctx.reply('📭 У вас ещё нет заказов.');
+
+  let text = `📦 *Ваши заказы:*\n\n`;
+  for (const o of orders) {
+    text += `*\\#${escapeMarkdown(o.order_id)}* — ${escapeMarkdown(statusLabel(o.status))} ${o.type === 'rent' ? '🔑' : '🛒'}\n`;
+    text += `🎮 ${escapeMarkdown(o.account_title || '—')}\n`;
+    text += `💰 ${escapeMarkdown(formatPrice(o.price))} • 🕐 ${escapeMarkdown(formatDate(o.created_at))}\n\n`;
+  }
+
+  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+});
+
+bot.hears('❓ Помощь', async (ctx) => {
+  const isAdm = isAdminChat(ctx);
+  let text =
+    `❓ *Помощь*\n\n` +
+    `*Как купить аккаунт:*\n` +
+    `1️⃣ Нажмите 📋 Каталог аккаунтов\n` +
+    `2️⃣ Выберите аккаунт и нажмите "Купить"\n` +
+    `3️⃣ Оплатите через СБП на указанный номер\n` +
+    `4️⃣ Нажмите "Я оплатил"\n` +
+    `5️⃣ Введите имя как в банке\n` +
+    `6️⃣ Дождитесь подтверждения\n` +
+    `7️⃣ Введите email → получите код\n` +
+    `8️⃣ Введите код из письма\n` +
+    `9️⃣ Готово\\! 🏆\n\n` +
+    `*Аренда:*\n` +
+    `🔑 Аккаунт доступен на 1 или 7 дней\n` +
+    `По истечении срока доступ закрывается автоматически\n\n` +
+    `📞 По вопросам: @brawlhelpp`;
+
+  if (isAdm) {
+    text +=
+      `\n\n*Кнопки администратора:*\n` +
+      `📊 Статистика — доходы и продажи\n` +
+      `📦 Все заказы — активные и завершённые\n` +
+      `⭐ Отзывы — последние отзывы покупателей\n` +
+      `🗂 Мои аккаунты — управление каталогом\n` +
+      `➕ Добавить аккаунт — пошаговое добавление`;
+  }
+
+  await ctx.reply(text, { parse_mode: 'MarkdownV2' });
+});
+
+bot.hears('➕ Добавить аккаунт', async (ctx) => {
+  if (!isAdmin(ctx)) return tempMsg(ctx.chat.id, '🔒 Введите /login пароль');
+  ctx.session = ctx.session || {};
+  ctx.session.step = 'admin_add_title';
+  await ctx.reply(
+    `➕ *Добавление аккаунта*\n\nШаг 1/5 — Введите название:\n_Например: Brawl Stars — 35 000 кубков_`,
+    {
+      parse_mode: 'MarkdownV2',
+      reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
+    }
+  );
+});
+
+bot.action('admin_cancel_add', async (ctx) => {
+  ctx.session = ctx.session || {};
+  ctx.session.step = null;
+  ctx.session.newAccount = null;
+  await ctx.answerCbQuery('Отменено');
+  await ctx.reply('❌ Добавление отменено.');
+});
+
+bot.action(/^del_acc_(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
+  const id = ctx.match[1];
+  const account = accountsDb.getById(id);
+  if (!account) return ctx.answerCbQuery('❌ Не найден');
+  accountsDb.delete(id);
+  await ctx.answerCbQuery(`✅ Удалён`);
+  try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
+  await ctx.reply(`✅ Аккаунт *${escapeMarkdown(account.title)}* удалён\\.`, { parse_mode: 'MarkdownV2' });
+});
+
+bot.action(/^admin_order_(.+)$/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
+  const orderId = ctx.match[1];
+  const o = ordersDb.get(orderId);
+  if (!o) return ctx.answerCbQuery('❌ Не найден');
+
+  const buttons = [];
+  if (o.status === 'pending') {
+    buttons.push([
+      { text: '✅ Подтвердить', callback_data: `fulfill_${o.order_id}` },
+      { text: '❌ Отклонить', callback_data: `reject_${o.order_id}` },
+    ]);
+  } else if (o.status === 'code_received') {
+    buttons.push([
+      { text: '✅ Завершить', callback_data: `complete_${o.order_id}` },
+      { text: '❌ Отклонить', callback_data: `reject_${o.order_id}` },
+    ]);
+  }
+
+  let text =
+    `📦 *Заказ \\#${escapeMarkdown(o.order_id)}*\n\n` +
+    `${escapeMarkdown(statusLabel(o.status))} ${o.type === 'rent' ? '🔑 Аренда' : '🛒 Покупка'}\n\n` +
+    `👤 *${escapeMarkdown(o.buyer_name)}*\n` +
+    `🎮 ${escapeMarkdown(o.account_title || '—')}\n` +
+    `💰 ${escapeMarkdown(formatPrice(o.price))}`;
+  if (o.discount > 0) text += ` \\(−${escapeMarkdown(formatPrice(o.discount))}\\)`;
+  if (o.type === 'rent') text += `\n⏱ Срок: *${o.rent_days} дн\\.*`;
+  if (o.rent_until) text += `\n📅 До: *${escapeMarkdown(formatDate(o.rent_until))}*`;
+  text += '\n';
+  if (o.email) text += `📧 ${escapeMarkdown(o.email)}\n`;
+  if (o.code) text += `🔑 Код: *${escapeMarkdown(o.code)}*\n`;
+  text += `🕐 ${escapeMarkdown(formatDate(o.created_at))}`;
+
+  await ctx.answerCbQuery();
+  await ctx.reply(text, {
+    parse_mode: 'MarkdownV2',
+    reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined,
+  });
 });
 
 // =====================
@@ -994,28 +1443,88 @@ bot.on('text', async (ctx) => {
   try { await ctx.deleteMessage(); } catch (e) {}
 
   if (text.startsWith('/')) return;
-  if (text === '📋 Каталог аккаунтов') return;
-  if (text === '🔗 Моя реферальная ссылка') return;
+  if ([
+    '📋 Каталог аккаунтов', '🔗 Моя реферальная ссылка', '📦 Мои заказы',
+    '📊 Статистика', '📦 Все заказы', '⭐ Отзывы', '🗂 Мои аккаунты',
+    '➕ Добавить аккаунт', '❓ Помощь',
+  ].includes(text)) return;
 
-  if (text === '❓ Помощь') {
-    await tempMsg(chatId,
-      '📞 По вопросам: @brawlhelpp\n\n' +
-      '1️⃣ Нажмите "Каталог аккаунтов"\n' +
-      '2️⃣ Выберите аккаунт и нажмите "Купить"\n' +
-      '3️⃣ Оплатите через СБП на указанный номер\n' +
-      '4️⃣ Нажмите "Я оплатил"\n' +
-      '5️⃣ Введите имя как в банке\n' +
-      '6️⃣ Дождитесь подтверждения от продавца\n' +
-      '7️⃣ Введите email — получите код\n' +
-      '8️⃣ Введите код из письма\n' +
-      '9️⃣ Готово! 🏆\n\n' +
-      '🔗 Пригласите друга и получите скидку 100 ₽!',
-      10000
+  // --- Пошаговое добавление аккаунта (только для админа) ---
+  if (isAdminChat(ctx) && step === 'admin_add_title') {
+    ctx.session.newAccount = { title: text };
+    ctx.session.step = 'admin_add_stats';
+    await ctx.reply(
+      `✅ Название: *${escapeMarkdown(text)}*\n\nШаг 2/5 — Введите характеристики:\n_кубки бойцы цена год_\n_Например: 35000 70 1200 2024_`,
+      {
+        parse_mode: 'MarkdownV2',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
+      }
     );
     return;
   }
 
-  // --- Ввод имени ---
+  if (isAdminChat(ctx) && step === 'admin_add_stats') {
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 4 || parts.map(Number).some(isNaN)) {
+      await tempMsg(chatId, '❌ Введите 4 числа: кубки бойцы цена год\nНапример: 35000 70 1200 2024');
+      return;
+    }
+    const [trophies, fighters, price, year] = parts.map(Number);
+    ctx.session.newAccount = { ...ctx.session.newAccount, trophies, fighters, price, year };
+    ctx.session.step = 'admin_add_rent';
+    await ctx.reply(
+      `✅ Характеристики сохранены\\!\n\nШаг 3/5 — Введите цены аренды:\n_цена_за_1_день цена_за_7_дней_\n_Например: 100 500_\n\n_Напишите 0 0 если аренда не нужна_`,
+      {
+        parse_mode: 'MarkdownV2',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
+      }
+    );
+    return;
+  }
+
+  if (isAdminChat(ctx) && step === 'admin_add_rent') {
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 2 || parts.map(Number).some(isNaN)) {
+      await tempMsg(chatId, '❌ Введите 2 числа: цена за 1 день и цена за 7 дней\nНапример: 100 500\nИли 0 0 если аренда не нужна');
+      return;
+    }
+    const [rentDay, rentWeek] = parts.map(Number);
+    ctx.session.newAccount = { ...ctx.session.newAccount, rent_price_day: rentDay, rent_price_week: rentWeek };
+    ctx.session.step = 'admin_add_image';
+    await ctx.reply(
+      `✅ Цены аренды сохранены\\!\n\nШаг 4/5 — Отправьте ссылку на фото:\n_Например: https://i\\.ibb\\.co/xxx/photo\\.jpg_`,
+      {
+        parse_mode: 'MarkdownV2',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel_add' }]] },
+      }
+    );
+    return;
+  }
+
+  if (isAdminChat(ctx) && step === 'admin_add_image') {
+    if (!text.startsWith('http')) {
+      await tempMsg(chatId, '❌ Ссылка должна начинаться с http');
+      return;
+    }
+    const acc = ctx.session.newAccount;
+    const id = 'acc-' + Date.now();
+    accountsDb.add({ id, ...acc, image_url: text });
+    ctx.session.step = null;
+    ctx.session.newAccount = null;
+
+    await ctx.reply(
+      `✅ *Аккаунт добавлен в каталог\\!*\n\n` +
+      `🏆 ${escapeMarkdown(acc.title)}\n` +
+      `🥇 ${acc.trophies.toLocaleString('ru-RU')} кубков • ⚔️ ${acc.fighters} бойцов\n` +
+      `💰 Цена: ${escapeMarkdown(formatPrice(acc.price))}\n` +
+      `🔑 Аренда: ${acc.rent_price_day > 0 ? escapeMarkdown(formatPrice(acc.rent_price_day)) + '/день' : 'нет'}\n` +
+      `📅 ${acc.year}`,
+      { parse_mode: 'MarkdownV2' }
+    );
+    return;
+  }
+
+  // --- Ввод имени покупателем ---
   if (step === 'awaiting_name') {
     if (text.length < 3) {
       await tempMsg(chatId, '❌ Введите полное имя и первую букву фамилии.\nНапример: Александр К');
@@ -1033,8 +1542,16 @@ bot.on('text', async (ctx) => {
     ctx.session.buyerName = text;
     ctx.session.step = 'awaiting_admin_confirm';
 
-    const discount = ctx.session.pendingDiscount || 0;
-    const finalPrice = Math.max(0, account.price - discount);
+    const orderType = ctx.session.orderType || 'buy';
+    const rentDays = ctx.session.rentDays || 0;
+    const discount = orderType === 'buy' ? (ctx.session.pendingDiscount || 0) : 0;
+    let price;
+    if (orderType === 'rent') {
+      price = rentDays === 1 ? account.rent_price_day : account.rent_price_week;
+    } else {
+      price = Math.max(0, account.price - discount);
+    }
+
     const orderId = generateOrderId();
     const userRecord = usersDb.get(String(chatId));
 
@@ -1044,24 +1561,31 @@ bot.on('text', async (ctx) => {
       buyer_name: text,
       account_id: account.id,
       account_title: account.title,
-      price: account.price,
+      price,
+      type: orderType,
+      rent_days: rentDays,
+      rent_until: null,
       referred_by: userRecord?.referred_by || null,
       discount,
     });
     ctx.session.orderId = orderId;
 
-    // Списываем скидку сразу при создании заказа
     if (discount > 0) {
       db.prepare('UPDATE users SET discount = 0 WHERE chat_id = ?').run(String(chatId));
     }
 
-    await goTo(chatId, ctx.session, screenWaiting(orderId, text));
+    await goTo(chatId, ctx.session, screenWaiting(orderId, text, orderType));
+
+    const typeLabel = orderType === 'rent'
+      ? `🔑 Аренда ${rentDays} дн\\.`
+      : '🛒 Покупка';
 
     await notifyAdmin(
       `🆕 *Новый заказ \\#${escapeMarkdown(orderId)}*\n\n` +
+      `${typeLabel}\n` +
       `👤 Имя: *${escapeMarkdown(text)}*\n` +
       `🎮 ${escapeMarkdown(account.title)}\n` +
-      `💰 ${escapeMarkdown(formatPrice(finalPrice))}` +
+      `💰 ${escapeMarkdown(formatPrice(price))}` +
       (discount > 0 ? ` \\(−${escapeMarkdown(formatPrice(discount))} скидка\\)` : '') +
       `\n\nПроверьте перевод по имени и подтвердите:`,
       [[
@@ -1099,14 +1623,13 @@ bot.on('text', async (ctx) => {
 
     await notifyAdmin(
       `📧 *Заказ \\#${escapeMarkdown(orderId)}* — email получен\n\n` +
-      `👤 ${escapeMarkdown(order.buyer_name)}\n` +
-      `📧 *${escapeMarkdown(text)}*`,
+      `👤 ${escapeMarkdown(order.buyer_name)}\n📧 *${escapeMarkdown(text)}*`,
       [[{ text: '📨 Запросить код у покупателя', callback_data: `askcode_${orderId}` }]]
     );
     return;
   }
 
-  // --- Ввод кода ---
+  // --- Ввод кода из email ---
   if (step === 'awaiting_code_from_email') {
     if (!/^\d{6}$/.test(text)) {
       await tempMsg(chatId, '❌ Код должен состоять из 6 цифр.\nПроверьте письмо и попробуйте ещё раз.');
@@ -1128,9 +1651,7 @@ bot.on('text', async (ctx) => {
 
     await notifyAdmin(
       `🔑 *Заказ \\#${escapeMarkdown(orderId)}* — код от покупателя\n\n` +
-      `👤 ${escapeMarkdown(order.buyer_name)}\n` +
-      `📧 ${escapeMarkdown(order.email || '—')}\n` +
-      `🔑 Код: *${escapeMarkdown(text)}*`,
+      `👤 ${escapeMarkdown(order.buyer_name)}\n📧 ${escapeMarkdown(order.email || '—')}\n🔑 Код: *${escapeMarkdown(text)}*`,
       [[
         { text: '✅ Завершить заказ', callback_data: `complete_${orderId}` },
         { text: '❌ Отклонить', callback_data: `reject_${orderId}` },
@@ -1156,9 +1677,7 @@ bot.on('text', async (ctx) => {
         text: text.slice(0, 500),
       });
       await notifyAdmin(
-        `⭐ *Новый отзыв*\n\n` +
-        `${'⭐'.repeat(ctx.session.reviewStars || 5)} — ${escapeMarkdown(ctx.session.buyerName || 'Покупатель')}\n` +
-        `_${escapeMarkdown(text.slice(0, 300))}_`
+        `⭐ *Новый отзыв*\n\n${'⭐'.repeat(ctx.session.reviewStars || 5)} — ${escapeMarkdown(ctx.session.buyerName || 'Покупатель')}\n_${escapeMarkdown(text.slice(0, 300))}_`
       );
     }
     ctx.session.step = 'catalog';
@@ -1179,6 +1698,11 @@ async function handleFulfill(ctx, orderId) {
   }
 
   ordersDb.update(orderId, { status: 'confirmed' });
+
+  if (order.type === 'rent') {
+    accountsDb.setRented(order.account_id, true);
+  }
+
   pendingEmailByChatId.set(String(order.buyer_chat_id), orderId);
 
   await ctx.reply(
@@ -1203,10 +1727,11 @@ async function handleReject(ctx, orderId) {
 
   ordersDb.update(orderId, { status: 'rejected' });
 
-  await ctx.reply(
-    `❌ Заказ *\\#${escapeMarkdown(orderId)}* отклонён\\.`,
-    { parse_mode: 'MarkdownV2' }
-  );
+  if (order.type === 'rent') {
+    accountsDb.setRented(order.account_id, false);
+  }
+
+  await ctx.reply(`❌ Заказ *\\#${escapeMarkdown(orderId)}* отклонён\\.`, { parse_mode: 'MarkdownV2' });
 
   if (order.buyer_chat_id) {
     try {
@@ -1228,11 +1753,20 @@ async function handleComplete(ctx, orderId) {
     return;
   }
 
-  ordersDb.update(orderId, { status: 'fulfilled' });
-  accountsDb.markSold(order.account_id);
+  const rentUntil = order.type === 'rent' ? rentUntilDate(order.rent_days || 1) : null;
+
+  ordersDb.update(orderId, {
+    status: 'fulfilled',
+    rent_until: rentUntil,
+  });
+
+  if (order.type === 'buy') {
+    accountsDb.markSold(order.account_id);
+  }
+
   usersDb.incrementOrders(String(order.buyer_chat_id));
 
-  // Реферальный бонус — начислить пригласившему
+  // Реферальный бонус
   if (order.referred_by) {
     usersDb.addDiscount(order.referred_by, 100);
     try {
@@ -1244,11 +1778,15 @@ async function handleComplete(ctx, orderId) {
     } catch (e) {}
   }
 
+  const rentInfo = rentUntil
+    ? `\n⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*`
+    : '';
+
   await ctx.reply(
     `🏆 Заказ *\\#${escapeMarkdown(orderId)}* завершён\\!\n\n` +
     `👤 ${escapeMarkdown(order.buyer_name)}\n` +
     `📧 ${escapeMarkdown(order.email || '—')}\n` +
-    `🔑 ${escapeMarkdown(order.code || '—')}`,
+    `🔑 ${escapeMarkdown(order.code || '—')}${rentInfo}`,
     { parse_mode: 'MarkdownV2' }
   );
 
@@ -1256,9 +1794,10 @@ async function handleComplete(ctx, orderId) {
     try {
       const sent = await bot.telegram.sendMessage(
         Number(order.buyer_chat_id),
-        `🎉 *Поздравляем\\! Заказ завершён\\!*\n\n` +
-        `🏆 Аккаунт *${escapeMarkdown(order.account_title)}* передан вам\\.\n\n` +
-        `Спасибо за покупку\\! По вопросам: @brawlhelpp`,
+        `🎉 *${order.type === 'rent' ? 'Аренда активирована\\!' : 'Заказ завершён\\!'}*\n\n` +
+        `🏆 Аккаунт *${escapeMarkdown(order.account_title)}* ${order.type === 'rent' ? 'в вашем распоряжении' : 'передан вам'}\\.\n` +
+        (rentUntil ? `⏱ Аренда до: *${escapeMarkdown(formatDate(rentUntil))}*\n` : '') +
+        `\nСпасибо за покупку\\! По вопросам: @brawlhelpp`,
         { parse_mode: 'MarkdownV2' }
       );
       pendingMainMsgStore.set(String(order.buyer_chat_id), sent.message_id);
@@ -1269,12 +1808,14 @@ async function handleComplete(ctx, orderId) {
 
 // Кнопки в сообщениях админа
 bot.action(/^fulfill_(.+)$/, async (ctx) => {
+  if (!isAdminChat(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
   await ctx.answerCbQuery('✅ Подтверждаю...');
   await handleFulfill(ctx, ctx.match[1]);
 });
 
 bot.action(/^askcode_(.+)$/, async (ctx) => {
+  if (!isAdminChat(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
   const orderId = ctx.match[1];
   const order = ordersDb.get(orderId);
   if (!order) return ctx.answerCbQuery('❌ Заказ не найден');
@@ -1296,12 +1837,14 @@ bot.action(/^askcode_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^complete_(.+)$/, async (ctx) => {
+  if (!isAdminChat(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
   await ctx.answerCbQuery('✅ Завершаю...');
   await handleComplete(ctx, ctx.match[1]);
 });
 
 bot.action(/^reject_(.+)$/, async (ctx) => {
+  if (!isAdminChat(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
   await ctx.answerCbQuery('❌ Отклоняю...');
   await handleReject(ctx, ctx.match[1]);
@@ -1324,8 +1867,7 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.json({ ok: true, message: 'Bot is running' }));
 
 app.get('/api/orders', (req, res) => {
-  const list = ordersDb.getAll();
-  res.json({ orders: list });
+  res.json({ orders: ordersDb.getAll() });
 });
 
 app.get('/api/order/:id', (req, res) => {
@@ -1338,8 +1880,27 @@ app.get('/api/order/:id', (req, res) => {
     accountTitle: order.account_title,
     price: order.price,
     discount: order.discount,
+    type: order.type,
+    rentDays: order.rent_days,
+    rentUntil: order.rent_until,
     createdAt: order.created_at,
   });
+});
+
+app.post('/api/fulfill/:id', async (req, res) => {
+  const order = ordersDb.get(req.params.id.toUpperCase());
+  if (!order) return res.status(404).json({ error: 'Not found' });
+  const fakeCtx = { reply: (t, o) => bot.telegram.sendMessage(ADMIN_CHAT_ID, t, o) };
+  await handleFulfill(fakeCtx, order.order_id);
+  res.json({ ok: true });
+});
+
+app.post('/api/reject/:id', async (req, res) => {
+  const order = ordersDb.get(req.params.id.toUpperCase());
+  if (!order) return res.status(404).json({ error: 'Not found' });
+  const fakeCtx = { reply: (t, o) => bot.telegram.sendMessage(ADMIN_CHAT_ID, t, o) };
+  await handleReject(fakeCtx, order.order_id);
+  res.json({ ok: true });
 });
 
 const PORT = process.env.PORT || 3000;
