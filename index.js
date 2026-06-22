@@ -263,26 +263,43 @@ function getSupercellCode() {
     let resolved = false;
 
     imap.once('ready', () => {
+      console.log('[Gmail] Подключились к IMAP');
       imap.openBox('INBOX', false, (err) => {
-        if (err) { imap.end(); return reject(err); }
+        if (err) {
+          console.error('[Gmail] Ошибка открытия INBOX:', err.message);
+          imap.end();
+          return reject(err);
+        }
 
-        const since = new Date(Date.now() - 15 * 60 * 1000);
+        const since = new Date(Date.now() - 30 * 60 * 1000);
+        console.log('[Gmail] Ищем письма с:', since.toISOString());
 
+        // UNSEEN убран — ищем все письма за 30 минут
         imap.search(
-          ['UNSEEN', ['FROM', 'no-reply@supercell.com'], ['SINCE', since]],
+          [['FROM', 'no-reply@supercell.com'], ['SINCE', since]],
           (err, results) => {
-            if (err || !results || results.length === 0) {
+            if (err) {
+              console.error('[Gmail] Ошибка поиска:', err.message);
               imap.end();
-              return reject(new Error('📭 Письмо от Supercell не найдено. Попросите покупателя снова запросить код входа.'));
+              return reject(err);
+            }
+
+            console.log('[Gmail] Найдено писем:', results ? results.length : 0);
+
+            if (!results || results.length === 0) {
+              imap.end();
+              return reject(new Error('📭 Письмо от Supercell не найдено. Попросите покупателя снова нажать "Отправить код" в игре.'));
             }
 
             const latest = [results[results.length - 1]];
+            console.log('[Gmail] Читаем письмо UID:', latest[0]);
             const fetch = imap.fetch(latest, { bodies: '' });
 
             fetch.on('message', (msg) => {
               msg.on('body', (stream) => {
                 simpleParser(stream, (err, parsed) => {
                   if (err) {
+                    console.error('[Gmail] Ошибка парсинга:', err.message);
                     imap.end();
                     if (!resolved) { resolved = true; reject(err); }
                     return;
@@ -293,6 +310,9 @@ function getSupercellCode() {
                   const html = parsed.html || '';
                   const fullText = text + ' ' + html;
 
+                  console.log('[Gmail] Subject:', subject);
+                  console.log('[Gmail] Text preview:', text.slice(0, 300));
+
                   const isDangerous =
                     subject.includes('смену адреса') ||
                     subject.includes('смену электронной') ||
@@ -302,6 +322,7 @@ function getSupercellCode() {
                     fullText.includes('изменить адрес электронной почты');
 
                   if (isDangerous) {
+                    console.warn('[Gmail] Опасное письмо — пропускаем');
                     imap.end();
                     if (!resolved) {
                       resolved = true;
@@ -313,22 +334,34 @@ function getSupercellCode() {
                   const isLoginEmail =
                     subject.includes('хочет загрузить') ||
                     subject.includes('игровые достижения') ||
+                    subject.includes('verification') ||
+                    subject.includes('верификац') ||
                     fullText.includes('хочет загрузить свои игровые достижения') ||
                     (fullText.includes('Выполняется вход') && fullText.includes('Brawl Stars')) ||
                     fullText.includes('Сообщите этот код верификации') ||
                     fullText.includes('код верификации') ||
-                    fullText.includes('verification code');
+                    fullText.includes('verification code') ||
+                    fullText.includes('Brawl Stars');
+
+                  console.log('[Gmail] isLoginEmail:', isLoginEmail);
 
                   if (!isLoginEmail) {
                     imap.end();
                     if (!resolved) {
                       resolved = true;
-                      reject(new Error('📧 Письмо не является кодом входа Brawl Stars. Попросите покупателя снова запросить код.'));
+                      reject(new Error('📧 Письмо не является кодом входа Brawl Stars. Попросите покупателя снова нажать "Отправить код".'));
                     }
                     return;
                   }
 
-                  const codeMatch = fullText.match(/\b(\d[\s]?\d[\s]?\d[\s]?\d[\s]?\d[\s]?\d)\b/);
+                  // Ищем 6-значный код разными способами
+                  const codeMatch =
+                    fullText.match(/\b(\d{6})\b/) ||
+                    fullText.match(/(\d)\s(\d)\s(\d)\s(\d)\s(\d)\s(\d)/) ||
+                    fullText.match(/(\d{3})[- ](\d{3})/);
+
+                  console.log('[Gmail] codeMatch:', codeMatch ? codeMatch[0] : 'не найден');
+
                   if (!codeMatch) {
                     imap.end();
                     if (!resolved) {
@@ -338,7 +371,9 @@ function getSupercellCode() {
                     return;
                   }
 
-                  const code = codeMatch[1].replace(/\s/g, '');
+                  const code = codeMatch[0].replace(/\D/g, '');
+                  console.log('[Gmail] Итоговый код:', code);
+
                   imap.addFlags(latest, '\\Seen', () => {});
                   imap.end();
 
@@ -351,6 +386,7 @@ function getSupercellCode() {
             });
 
             fetch.once('error', (err) => {
+              console.error('[Gmail] Fetch error:', err.message);
               imap.end();
               if (!resolved) { resolved = true; reject(err); }
             });
@@ -368,6 +404,7 @@ function getSupercellCode() {
     });
 
     imap.once('error', (err) => {
+      console.error('[Gmail] IMAP connection error:', err.message);
       if (!resolved) { resolved = true; reject(err); }
     });
 
@@ -430,7 +467,6 @@ const pendingMainMsgStore = new Map();
 const pendingLastOrderStore = new Map();
 const verifiedAdmins = new Set();
 
-// Map для хранения ID сообщений "🔒 Введите /login пароль"
 const lockMsgStore = new Map();
 
 function isAdmin(ctx) {
@@ -469,7 +505,6 @@ async function tempMsg(chatId, text, delay = 4000) {
   } catch (e) {}
 }
 
-// Постоянное сообщение с кнопкой "✖ Закрыть" — висит пока не удалишь
 async function lockMsg(chatId, text) {
   const prevId = lockMsgStore.get(String(chatId));
   if (prevId) {
@@ -486,7 +521,6 @@ async function lockMsg(chatId, text) {
   } catch (e) {}
 }
 
-// Удалить lock-сообщение
 async function deleteLockMsg(chatId) {
   const msgId = lockMsgStore.get(String(chatId));
   if (msgId) {
@@ -505,7 +539,6 @@ async function notifyAdmin(text, keyboard) {
   } catch (e) { console.warn('Admin notify error:', e.message); }
 }
 
-// Проверка истёкших аренд каждые 10 минут
 setInterval(async () => {
   const expired = ordersDb.getExpiredRentals();
   for (const order of expired) {
@@ -656,7 +689,6 @@ function screenRentPayment(account, days, price) {
   };
 }
 
-// Экран аренды: показываем почту магазина покупателю
 function screenRentEnterShopEmail(accountTitle, orderId) {
   return {
     type: 'text',
@@ -1020,7 +1052,7 @@ bot.command('login', async (ctx) => {
   try { await ctx.deleteMessage(); } catch (e) {}
   if (password === ADMIN_PASSWORD) {
     verifiedAdmins.add(String(ctx.chat.id));
-    await deleteLockMsg(ctx.chat.id); // удаляем lock-сообщение при успешном входе
+    await deleteLockMsg(ctx.chat.id);
     await ctx.reply('✅ Вы вошли как администратор. Все кнопки активны.');
   } else {
     await ctx.reply('❌ Неверный пароль.');
@@ -1379,7 +1411,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
     return;
   }
 
-  // Защита от спама — не чаще 3 раз за 2 минуты
   if (spamDb.check(String(ctx.chat.id), 'getrentcode', 3, 2)) {
     await ctx.answerCbQuery('⏳ Подождите немного перед повторной попыткой');
     return;
@@ -1388,10 +1419,8 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
 
   await ctx.answerCbQuery('📨 Читаю письмо...');
 
-  // Убираем кнопки с предыдущего сообщения
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
 
-  // Сообщение загрузки
   const loadingMsg = await bot.telegram.sendMessage(
     ctx.chat.id,
     `⏳ *Читаю письмо от Supercell\\.\\.\\.*\n\nПодождите несколько секунд\\.`,
@@ -1401,12 +1430,10 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
   try {
     const code = await getSupercellCode();
 
-    // Удаляем сообщение загрузки
     try { await bot.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
 
     const rentUntil = rentUntilDate(order.rent_days || 1);
 
-    // Сохраняем код и завершаем заказ
     ordersDb.update(orderId, {
       status: 'fulfilled',
       code: code,
@@ -1415,7 +1442,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
 
     usersDb.incrementOrders(String(order.buyer_chat_id));
 
-    // Реферальный бонус
     if (order.referred_by) {
       usersDb.addDiscount(order.referred_by, 100);
       try {
@@ -1427,7 +1453,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
       } catch (e) {}
     }
 
-    // Отправляем код покупателю
     const sent = await bot.telegram.sendMessage(
       ctx.chat.id,
       `🎉 *Аренда активирована\\!*\n\n` +
@@ -1450,7 +1475,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
     pendingLastOrderStore.set(String(ctx.chat.id), orderId);
     ctx.session.lastOrderId = orderId;
 
-    // Уведомляем админа
     await notifyAdmin(
       `✅ *Аренда завершена автоматически*\n\n` +
       `Заказ: *\\#${escapeMarkdown(orderId)}*\n` +
@@ -1463,10 +1487,8 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
   } catch (err) {
     console.error('[Gmail RENT ERROR]', err.message);
 
-    // Удаляем сообщение загрузки
     try { await bot.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
 
-    // Показываем ошибку с кнопкой попробовать снова
     const sent = await bot.telegram.sendMessage(
       ctx.chat.id,
       `❌ *Не удалось получить код:*\n\n${escapeMarkdown(err.message)}\n\n` +
@@ -1484,7 +1506,6 @@ bot.action(/^getrentcode_(.+)$/, async (ctx) => {
     );
     pendingMainMsgStore.set(String(ctx.chat.id), sent.message_id);
 
-    // Уведомляем админа об ошибке
     await notifyAdmin(
       `⚠️ *Ошибка чтения кода для аренды*\n\n` +
       `Заказ: *\\#${escapeMarkdown(orderId)}*\n` +
@@ -1531,9 +1552,6 @@ bot.action('skip_review', async (ctx) => {
   await goTo(ctx.chat.id, ctx.session, buildCatalogScreen(0, getUserDiscount(ctx.chat.id)));
 });
 
-// =====================
-// КНОПКА "ЗАКРЫТЬ" LOCK-СООБЩЕНИЯ
-// =====================
 bot.action('close_lock_msg', async (ctx) => {
   await ctx.answerCbQuery();
   await deleteLockMsg(ctx.chat.id);
@@ -1557,7 +1575,7 @@ bot.hears('🔗 Моя реферальная ссылка', async (ctx) => {
 });
 
 // =====================
-// КНОПКИ АДМИНА (с lockMsg вместо tempMsg)
+// КНОПКИ АДМИНА
 // =====================
 bot.hears('📊 Статистика', async (ctx) => {
   await deleteLockMsg(ctx.chat.id);
@@ -1770,7 +1788,6 @@ bot.on('text', async (ctx) => {
     '➕ Добавить аккаунт', '❓ Помощь',
   ].includes(text)) return;
 
-  // Пошаговое добавление аккаунта
   if (isAdminChat(ctx) && step === 'admin_add_title') {
     ctx.session.newAccount = { title: text };
     ctx.session.step = 'admin_add_stats';
@@ -1845,7 +1862,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Ввод имени покупателем
   if (step === 'awaiting_name') {
     if (text.length < 3) {
       await tempMsg(chatId, '❌ Введите полное имя и первую букву фамилии.\nНапример: Александр К');
@@ -1922,7 +1938,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Ввод email (только для покупки, не для аренды)
   if (step === 'awaiting_email') {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
       await tempMsg(chatId, '❌ Неверный формат email.\nНапример: example@mail.ru');
@@ -1950,7 +1965,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Ввод кода из email
   if (step === 'awaiting_code_from_email') {
     if (!/^\d{6}$/.test(text)) {
       await tempMsg(chatId, '❌ Код должен состоять из 6 цифр.\nПроверьте письмо и попробуйте ещё раз.');
@@ -1986,7 +2000,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Текст отзыва
   if (step === 'awaiting_review_text') {
     const orderId = ctx.session.lastOrderId;
     if (orderId && !reviewsDb.hasReview(orderId)) {
@@ -2021,7 +2034,6 @@ async function handleFulfill(ctx, orderId) {
   ordersDb.update(orderId, { status: 'confirmed' });
 
   if (order.type === 'rent') {
-    // Для аренды — сразу отправляем почту магазина, email не спрашиваем
     accountsDb.setRented(order.account_id, true);
 
     await ctx.reply(
@@ -2043,7 +2055,6 @@ async function handleFulfill(ctx, orderId) {
     } catch (e) { console.warn(e.message); }
 
   } else {
-    // Для покупки — спрашиваем email как раньше
     pendingEmailByChatId.set(String(order.buyer_chat_id), orderId);
 
     await ctx.reply(
@@ -2166,7 +2177,6 @@ async function handleComplete(ctx, orderId) {
   }
 }
 
-// Кнопки в сообщениях админа
 bot.action(/^fulfill_(.+)$/, async (ctx) => {
   if (!isAdminChat(ctx)) return ctx.answerCbQuery('🔒 Нет доступа');
   try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (e) {}
